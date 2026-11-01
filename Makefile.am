@@ -793,6 +793,10 @@ if WIN32
 src_libdrivers_la_SOURCES += \
 	src/hardware/xsdk-xlogic/xlogic_winusb_backend.c \
 	src/hardware/xsdk-xlogic/xlogic_winusb_backend.h \
+	src/hardware/xsdk-xlogic/xlogic_winusb_worker.c \
+	src/hardware/xsdk-xlogic/xlogic_winusb_worker.h \
+	src/hardware/xsdk-xlogic/xlogic_wire_pool.c \
+	src/hardware/xsdk-xlogic/xlogic_wire_pool.h \
 	src/hardware/xsdk-xlogic/xlogic_capture_winusb.c \
 	src/hardware/xsdk-xlogic/xlogic_capture_winusb.h \
 	src/hardware/xsdk-xlogic/xlogic_winusb_protocol.h
