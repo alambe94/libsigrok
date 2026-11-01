@@ -32,6 +32,7 @@
 
 struct out_context {
 	gboolean zip_created;
+	zip_uint32_t compression_level;
 	uint64_t samplerate;
 	char *filename;
 	size_t first_analog_index;
@@ -54,7 +55,17 @@ static int init(struct sr_output *o, GHashTable *options)
 {
 	struct out_context *outc;
 
-	(void)options;
+	GVariant *compression;
+	gint32 level = 9;
+
+	compression = options ? g_hash_table_lookup(options, "compression-level") : NULL;
+	if (compression) {
+		if (!g_variant_is_of_type(compression, G_VARIANT_TYPE_INT32))
+			return SR_ERR_ARG;
+		level = g_variant_get_int32(compression);
+	}
+	if (level < 1 || level > 9)
+		return SR_ERR_ARG;
 
 	if (!o->filename || o->filename[0] == '\0') {
 		sr_info("srzip output module requires a file name, cannot save.");
@@ -63,6 +74,7 @@ static int init(struct sr_output *o, GHashTable *options)
 
 	outc = g_malloc0(sizeof(*outc));
 	outc->filename = g_strdup(o->filename);
+	outc->compression_level = (zip_uint32_t)level;
 	o->priv = outc;
 
 	return SR_OK;
@@ -251,6 +263,30 @@ static int zip_create(const struct sr_output *o)
 	return SR_OK;
 }
 
+/* Add one sample chunk without committing the archive. The caller owns the
+ * transaction and discards it on failure, preserving the last valid prefix. */
+static zip_int64_t zip_add_compressed_chunk(struct zip *archive,
+	const char *name, const void *data, size_t length, zip_uint32_t level)
+{
+	struct zip_source *source;
+	zip_int64_t index;
+	int ret;
+
+	source = zip_source_buffer(archive, data, length, FALSE);
+	if (!source)
+		return -1;
+	index = zip_file_add(archive, name, source, 0);
+	if (index < 0) {
+		zip_source_free(source);
+		return -1;
+	}
+	/* ZIP_CM_DEFAULT can clear the level flags in libzip. */
+	ret = zip_set_file_compression(archive, index, ZIP_CM_DEFLATE, level);
+	if (ret < 0)
+		return -1;
+	return index;
+}
+
 /**
  * Append a block of logic data to an srzip archive.
  *
@@ -266,7 +302,6 @@ static int zip_append(const struct sr_output *o,
 {
 	struct out_context *outc;
 	struct zip *archive;
-	struct zip_source *logicsrc;
 	int64_t i, num_files;
 	struct zip_stat zs;
 	struct zip_source *metasrc;
@@ -361,14 +396,13 @@ static int zip_append(const struct sr_output *o,
 		sr_warn("Chunk size %zu not a multiple of the"
 			" unit size %zu.", length, unitsize);
 	}
-	logicsrc = zip_source_buffer(archive, buf, length, FALSE);
 	chunkname = g_strdup_printf("logic-1-%u", next_chunk_num);
-	i = zip_file_add(archive, chunkname, logicsrc, 0);
+	i = zip_add_compressed_chunk(archive, chunkname, buf, length,
+		outc->compression_level);
 	g_free(chunkname);
 	if (i < 0) {
 		sr_err("Failed to add chunk 'logic-1-%u': %s",
 			next_chunk_num, zip_strerror(archive));
-		zip_source_free(logicsrc);
 		zip_discard(archive);
 		g_free(metabuf);
 		return SR_ERR;
@@ -514,7 +548,6 @@ static int zip_append_analog(const struct sr_output *o,
 {
 	struct out_context *outc;
 	struct zip *archive;
-	struct zip_source *analogsrc;
 	int64_t i, num_files;
 	size_t size;
 	struct zip_stat zs;
@@ -552,14 +585,13 @@ static int zip_append_analog(const struct sr_output *o,
 	}
 
 	size = sizeof(values[0]) * count;
-	analogsrc = zip_source_buffer(archive, values, size, FALSE);
 	chunkname = g_strdup_printf("%s-%u", basename, next_chunk_num);
-	i = zip_file_add(archive, chunkname, analogsrc, 0);
+	i = zip_add_compressed_chunk(archive, chunkname, values, size,
+		outc->compression_level);
 	if (i < 0) {
 		sr_err("Failed to add chunk '%s': %s", chunkname, zip_strerror(archive));
 		g_free(chunkname);
 		g_free(basename);
-		zip_source_free(analogsrc);
 		zip_discard(archive);
 		return SR_ERR;
 	}
@@ -746,11 +778,21 @@ static int receive(const struct sr_output *o, const struct sr_datafeed_packet *p
 }
 
 static struct sr_option options[] = {
+	{"compression-level", "Compression level",
+		"Deflate compression level (1 fastest, 9 smallest)", NULL, NULL},
 	ALL_ZERO
 };
 
 static const struct sr_option *get_options(void)
 {
+	gint32 level;
+
+	if (!options[0].def) {
+		options[0].def = g_variant_ref_sink(g_variant_new_int32(9));
+		for (level = 1; level <= 9; level++)
+			options[0].values = g_slist_append(options[0].values,
+				g_variant_ref_sink(g_variant_new_int32(level)));
+	}
 	return options;
 }
 
