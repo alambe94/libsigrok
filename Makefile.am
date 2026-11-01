@@ -771,6 +771,34 @@ src_libdrivers_la_SOURCES += \
 	src/hardware/zeroplus-logic-cube/protocol.c \
 	src/hardware/zeroplus-logic-cube/api.c
 endif
+if HW_XSDK_XLOGIC
+src_libdrivers_la_SOURCES += \
+	src/hardware/xsdk-xlogic/protocol.h \
+	src/hardware/xsdk-xlogic/xlogic_xesk_host.h \
+	src/hardware/xsdk-xlogic/xlogic_network_wire.h \
+	src/hardware/xsdk-xlogic/network.c \
+	src/hardware/xsdk-xlogic/network_codec.c \
+	src/hardware/xsdk-xlogic/network_codec.h \
+	src/hardware/xsdk-xlogic/network_auto.c \
+	src/hardware/xsdk-xlogic/network_auto.h \
+	src/hardware/xsdk-xlogic/network_discovery.c \
+	src/hardware/xsdk-xlogic/network_discovery.h \
+	src/hardware/xsdk-xlogic/network_mdns.c \
+	src/hardware/xsdk-xlogic/xnet_dns_wire.c \
+	src/hardware/xsdk-xlogic/xnet_dns_wire.h \
+	src/hardware/xsdk-xlogic/xnet_return.h \
+	src/hardware/xsdk-xlogic/xreturn.h \
+	src/hardware/xsdk-xlogic/api.c
+if WIN32
+src_libdrivers_la_SOURCES += \
+	src/hardware/xsdk-xlogic/xlogic_winusb_backend.c \
+	src/hardware/xsdk-xlogic/xlogic_winusb_backend.h \
+	src/hardware/xsdk-xlogic/xlogic_capture_winusb.c \
+	src/hardware/xsdk-xlogic/xlogic_capture_winusb.h \
+	src/hardware/xsdk-xlogic/xlogic_winusb_protocol.h
+endif
+endif
+
 if HW_ZKETECH_EBD_USB
 src_libdrivers_la_SOURCES += \
 	src/hardware/zketech-ebd-usb/protocol.h \
