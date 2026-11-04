@@ -936,7 +936,7 @@ static int capture_options(struct sr_dev_inst *sdi, xsdk_xlogic_worker_config *o
     options->config.stream_format = rate->stream_format;
     options->queue_depth = xSDK_xLOGIC_TRANSFER_COUNT;
     options->transfer_bytes = xSDK_xLOGIC_DIRECT_TRANSFER_BYTES;
-    options->pool_depth = xSDK_xLOGIC_TRANSFER_COUNT;
+    options->pool_depth = xSDK_xLOGIC_DELIVERY_POOL_COUNT;
     options->requests_raw_io = TRUE;
     options->wire_limit_bytes = devc->continuous ? 0U : packed ? devc->limit_samples / 2U + devc->limit_samples % 2U : devc->limit_samples;
     return SR_OK;

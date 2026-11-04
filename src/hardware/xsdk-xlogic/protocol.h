@@ -58,6 +58,7 @@
 #define xSDK_xLOGIC_CONTIGUOUS_PAYLOAD_BYTES            32U
 #define xSDK_xLOGIC_TRANSFER_COUNT                      16U
 #define xSDK_xLOGIC_DIRECT_TRANSFER_BYTES               (2U * 1024U * 1024U)
+#define xSDK_xLOGIC_DELIVERY_POOL_COUNT                 32U
 #define xSDK_xLOGIC_CONTROL_TIMEOUT_MS                  1000U
 #define xSDK_xLOGIC_TRANSFER_TIMEOUT_MS                 5000U
 #define xSDK_xLOGIC_DEFAULT_SAMPLES                     (1024U * 1024U)
