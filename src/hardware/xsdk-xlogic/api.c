@@ -486,6 +486,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
     const char *conn;
     ssize_t count;
     int i;
+    gboolean usb_only;
 
     drvc = di->context;
     devices = NULL;
@@ -499,15 +500,16 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
             conn = g_variant_get_string(src->data, NULL);
         }
     }
+    usb_only = conn && !strcmp(conn, "usb");
     if (conn && (g_str_has_prefix(conn, "tcp-raw/") || g_str_has_prefix(conn, "tcp-xesk/")))
     {
         return xsdk_xlogic_network_scan(di, conn);
     }
-    if (conn)
+    if (conn && !usb_only)
     {
         conn_devices = sr_usb_find(drvc->sr_ctx->libusb_ctx, conn);
     }
-    if (conn && !conn_devices)
+    if (conn && !usb_only && !conn_devices)
     {
         return std_scan_complete(di, NULL);
     }
