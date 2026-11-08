@@ -1983,8 +1983,7 @@ SR_PRIV int xsdk_xlogic_network_start(struct sr_dev_inst *sdi)
     struct xsdk_xlogic_network *network = devc->network;
     int result;
 
-    if (devc->acquisition_state != xSDK_xLOGIC_ACQ_IDLE || devc->continuous ||
-        !xsdk_xlogic_network_depth_valid(devc, devc->limit_samples))
+    if (devc->acquisition_state != xSDK_xLOGIC_ACQ_IDLE || devc->continuous || devc->limit_samples == 0U)
     {
         return SR_ERR_ARG;
     }
@@ -2003,9 +2002,14 @@ SR_PRIV int xsdk_xlogic_network_start(struct sr_dev_inst *sdi)
             sr_tcp_disconnect(network->peer);
             return SR_ERR;
         }
+        if (!xsdk_xlogic_network_depth_valid(devc, devc->limit_samples))
+        {
+            sr_tcp_disconnect(network->peer);
+            return SR_ERR_ARG;
+        }
         return esk_start(sdi);
     }
-    if (network->peer->sock_fd < 0)
+    if (!xsdk_xlogic_network_depth_valid(devc, devc->limit_samples) || network->peer->sock_fd < 0)
     {
         return SR_ERR_ARG;
     }
