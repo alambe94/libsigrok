@@ -777,6 +777,10 @@ src_libdrivers_la_SOURCES += \
 	src/hardware/xsdk-xlogic/xlogic_xesk_host.h \
 	src/hardware/xsdk-xlogic/xlogic_network_wire.h \
 	src/hardware/xsdk-xlogic/network.c \
+	src/hardware/xsdk-xlogic/xesk_network_session.c \
+	src/hardware/xsdk-xlogic/xesk_network_session.h \
+	src/hardware/xsdk-xlogic/xesk_network_pump.c \
+	src/hardware/xsdk-xlogic/xesk_network_pump.h \
 	src/hardware/xsdk-xlogic/network_codec.c \
 	src/hardware/xsdk-xlogic/network_codec.h \
 	src/hardware/xsdk-xlogic/network_auto.c \
@@ -788,11 +792,34 @@ src_libdrivers_la_SOURCES += \
 	src/hardware/xsdk-xlogic/xnet_dns_wire.h \
 	src/hardware/xsdk-xlogic/xnet_return.h \
 	src/hardware/xsdk-xlogic/xreturn.h \
+	src/hardware/xsdk-xlogic/xbytes.h \
+	src/hardware/xsdk-xlogic/xutil_crc32.h \
+	src/hardware/xsdk-xlogic/xutil_crc32.c \
+	src/hardware/xsdk-xlogic/xesk.h \
+	src/hardware/xsdk-xlogic/xesk.c \
+	src/hardware/xsdk-xlogic/xesk_internal.h \
+	src/hardware/xsdk-xlogic/xesk_model.c \
+	src/hardware/xsdk-xlogic/xesk_payload.c \
+	src/hardware/xsdk-xlogic/xesk_resource_manager.h \
+	src/hardware/xsdk-xlogic/xesk_control.h \
+	src/hardware/xsdk-xlogic/xesk_control.c \
+	src/hardware/xsdk-xlogic/xesk_control_internal.h \
+	src/hardware/xsdk-xlogic/xesk_control_payload.c \
+	src/hardware/xsdk-xlogic/xesk_feature_status.h \
+	src/hardware/xsdk-xlogic/xesk_feature_status.c \
+	src/hardware/xsdk-xlogic/xesk_logic_network.h \
+	src/hardware/xsdk-xlogic/xesk_logic_network.c \
+	src/hardware/xsdk-xlogic/xlogic_network_protocol.h \
+	src/hardware/xsdk-xlogic/xlogic_network_protocol.c \
 	src/hardware/xsdk-xlogic/api.c
 if WIN32
 src_libdrivers_la_SOURCES += \
 	src/hardware/xsdk-xlogic/xlogic_winusb_backend.c \
 	src/hardware/xsdk-xlogic/xlogic_winusb_backend.h \
+	src/hardware/xsdk-xlogic/xlogic_winusb_worker.c \
+	src/hardware/xsdk-xlogic/xlogic_winusb_worker.h \
+	src/hardware/xsdk-xlogic/xlogic_wire_pool.c \
+	src/hardware/xsdk-xlogic/xlogic_wire_pool.h \
 	src/hardware/xsdk-xlogic/xlogic_capture_winusb.c \
 	src/hardware/xsdk-xlogic/xlogic_capture_winusb.h \
 	src/hardware/xsdk-xlogic/xlogic_winusb_protocol.h

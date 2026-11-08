@@ -58,6 +58,7 @@
 #define xSDK_xLOGIC_CONTIGUOUS_PAYLOAD_BYTES            32U
 #define xSDK_xLOGIC_TRANSFER_COUNT                      16U
 #define xSDK_xLOGIC_DIRECT_TRANSFER_BYTES               (2U * 1024U * 1024U)
+#define xSDK_xLOGIC_DELIVERY_POOL_COUNT                 32U
 #define xSDK_xLOGIC_CONTROL_TIMEOUT_MS                  1000U
 #define xSDK_xLOGIC_TRANSFER_TIMEOUT_MS                 5000U
 #define xSDK_xLOGIC_DEFAULT_SAMPLES                     (1024U * 1024U)
@@ -207,7 +208,7 @@ struct dev_context
     gboolean wire_accounting_partial;
 };
 
-SR_PRIV GVariant *xsdk_xlogic_network_sources(void);
+SR_PRIV GVariant *xsdk_xlogic_network_sources(const struct dev_context *devc);
 SR_PRIV gboolean xsdk_xlogic_caps_valid(const struct xsdk_xlogic_caps_wire *wire);
 SR_PRIV const char *xsdk_xlogic_network_source(const struct dev_context *devc);
 SR_PRIV int xsdk_xlogic_network_source_set(struct dev_context *devc, const char *source);

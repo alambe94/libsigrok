@@ -23,6 +23,7 @@
 #include "network_auto.h"
 #include "network_discovery.h"
 #include "xlogic_network_wire.h"
+#include "xesk_network_pump.h"
 
 #define xSDK_xLOGIC_NET_MAGIC          xLOGIC_NET_MAGIC
 #define xSDK_xLOGIC_NET_VERSION        xLOGIC_NET_VERSION
@@ -74,9 +75,28 @@ struct xsdk_xlogic_network_request
     size_t sent;
 };
 
+enum xsdk_xesk_phase
+{
+    xSDK_xESK_PHASE_CLAIM,
+    xSDK_xESK_PHASE_START,
+    xSDK_xESK_PHASE_STATUS,
+    xSDK_xESK_PHASE_READ,
+    xSDK_xESK_PHASE_FINISH,
+    xSDK_xESK_PHASE_RELEASE,
+    xSDK_xESK_PHASE_REAP,
+    xSDK_xESK_PHASE_RENEW,
+};
+
 struct xsdk_xlogic_network
 {
     struct sr_tcp_dev_inst *peer;
+    xSDK_xESK_Network_Pump_t *esk;
+    xESK_Device_t esk_device;
+    enum xsdk_xesk_phase esk_phase;
+    enum xsdk_xesk_phase esk_resume;
+    gint64 esk_renew_at;
+    gint64 esk_capture_deadline;
+    gint64 esk_retire_deadline;
     struct xsdk_xlogic_network_metadata capture;
     uint8_t *response;
     uint8_t *decoded;
@@ -296,6 +316,91 @@ static gboolean socket_would_block(void)
 #else
     return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
 #endif
+}
+
+static int esk_write(void *user, uint8_t *data, size_t bytes)
+{
+    struct xsdk_xlogic_network *network = user;
+    const int count = sr_tcp_write_bytes(network->peer, data, bytes);
+    if (count < 0 && socket_would_block())
+    {
+        return 0;
+    }
+    network->progressed |= count > 0;
+    return count > 0 ? count : -1;
+}
+
+static int esk_read(void *user, uint8_t *data, size_t bytes)
+{
+    struct xsdk_xlogic_network *network = user;
+    const int count = sr_tcp_read_bytes(network->peer, data, bytes, FALSE);
+    if (count < 0 && socket_would_block())
+    {
+        return 0;
+    }
+    network->progressed |= count > 0;
+    return count > 0 ? count : -1;
+}
+
+/* Scanning and opening are already synchronous libsigrok operations. Capture
+ * itself uses the session source; no socket wait is added to its callback. */
+static int esk_exchange(struct xsdk_xlogic_network *network, const xESK_Control_Message_t *request)
+{
+    const gint64 deadline = g_get_monotonic_time() + xSDK_xLOGIC_NET_TIMEOUT_US;
+    if (xSDK_xESK_Network_Queue(network->esk, request) != xRETURN_OK)
+    {
+        return SR_ERR;
+    }
+    while (g_get_monotonic_time() < deadline)
+    {
+        const xRETURN_t status = xSDK_xESK_Network_Pump(network->esk, network, esk_write, esk_read);
+        if (status == xRETURN_OK)
+        {
+            return SR_OK;
+        }
+        if (status != xRETURN_xERR_xESK_BUSY)
+        {
+            return SR_ERR;
+        }
+        g_usleep(1000U);
+    }
+    xSDK_xESK_Network_Poison(&network->esk->session);
+    return SR_ERR;
+}
+
+static int esk_describe(struct xsdk_xlogic_network *network)
+{
+    xESK_Control_Message_t request = {.opcode = xESK_CONTROL_DESCRIBE, .descriptor_kind = xESK_RECORD_DEVICE};
+    const xESK_Device_t previous = network->esk_device;
+    memset(network->esk, 0, sizeof(*network->esk));
+    if (esk_exchange(network, &request) != SR_OK || network->esk->reply.status != xESK_CONTROL_OK)
+    {
+        return SR_ERR;
+    }
+    const xESK_Device_t *device = &network->esk->session.device;
+    if (previous.boot_id != 0U &&
+        (previous.boot_id != device->boot_id || memcmp(previous.device_id, device->device_id, sizeof(previous.device_id)) != 0))
+    {
+        sr_err("xESK device identity changed; scan the device again.");
+        return SR_ERR;
+    }
+    request.descriptor_kind = xESK_RECORD_SERVICE;
+    for (uint32_t index = 0U; index < 32U; ++index)
+    {
+        request.index = index;
+        if (esk_exchange(network, &request) != SR_OK || network->esk->reply.status != xESK_CONTROL_OK)
+        {
+            return SR_ERR;
+        }
+        const xESK_Service_t *service = &network->esk->session.logic_service;
+        if (network->esk->session.has_finite_logic && (service->flags & xESK_SERVICE_LOGIC_RATE_PROFILE_1) != 0U)
+        {
+            network->esk_device = *device;
+            network->maximum_samples = MIN(service->buffer_bytes, xSDK_xLOGIC_NET_CAPACITY);
+            return SR_OK;
+        }
+    }
+    return SR_ERR;
 }
 
 static int send_request(struct xsdk_xlogic_network *network, uint32_t opcode, uint64_t identity, uint64_t argument0, uint64_t argument1)
@@ -743,7 +848,7 @@ static int accept_download(struct sr_dev_inst *sdi)
     struct dev_context *devc = sdi->priv;
     struct xsdk_xlogic_network *network = devc->network;
     const uint32_t length = RL32(request_head(network)->frame + 32U);
-    const uint8_t *samples = network->response + xSDK_xLOGIC_NET_RESPONSE_BYTES;
+    uint8_t *samples = network->response + xSDK_xLOGIC_NET_RESPONSE_BYTES;
     const size_t accepted = (size_t)MIN((uint64_t)length, devc->limit_samples - devc->sent_samples);
     const struct sr_datafeed_logic logic = {
         .length = accepted,
@@ -1110,6 +1215,250 @@ static int advance_network(struct sr_dev_inst *sdi)
     return result;
 }
 
+static int esk_queue_phase(struct sr_dev_inst *sdi, enum xsdk_xesk_phase phase)
+{
+    struct dev_context *devc = sdi->priv;
+    struct xsdk_xlogic_network *network = devc->network;
+    xSDK_xESK_Network_Session_t *session = &network->esk->session;
+    xESK_Control_Message_t request = {0};
+    if (phase == xSDK_xESK_PHASE_CLAIM || phase == xSDK_xESK_PHASE_RENEW)
+    {
+        request.opcode = phase == xSDK_xESK_PHASE_CLAIM ? xESK_CONTROL_CLAIM : xESK_CONTROL_RENEW;
+        request.expiry_policy = phase == xSDK_xESK_PHASE_CLAIM ? xESK_EXPIRY_DEADLINE : 0U;
+        request.lease_ticks = 60000U;
+    }
+    else if (phase == xSDK_xESK_PHASE_RELEASE || phase == xSDK_xESK_PHASE_REAP)
+    {
+        request.opcode = phase == xSDK_xESK_PHASE_RELEASE ? xESK_CONTROL_RELEASE : xESK_CONTROL_REAP;
+    }
+    else
+    {
+        request = (xESK_Control_Message_t){.kind = xESK_CONTROL_REQUEST,
+                                           .opcode = xESK_CONTROL_SERVICE,
+                                           .request_id = 1U,
+                                           .boot_id = session->boot_id,
+                                           .session_id = session->session_id,
+                                           .service_id = xESK_SERVICE_LOGIC};
+        xESK_Logic_Request_t command = {0};
+        command.capture_id = session->has_capture ? session->capture.capture_id : 0U;
+        if (phase == xSDK_xESK_PHASE_START)
+        {
+            command.opcode = xLOGIC_NET_OP_START;
+            command.format = xESK_LOGIC_FORMAT_RAW8;
+            command.channel_mask = 255U;
+            command.argument0 = network->rounded_samples;
+            command.argument1 = (uint32_t)devc->rates[devc->rate_index].actual;
+        }
+        else if (phase == xSDK_xESK_PHASE_STATUS)
+        {
+            command.opcode = xLOGIC_NET_OP_STATUS;
+        }
+        else if (phase == xSDK_xESK_PHASE_READ)
+        {
+            command.opcode = xLOGIC_NET_OP_READ_BLOCK;
+            command.argument0 = network->offset;
+            command.argument1 = (uint32_t)MIN((uint64_t)xLOGIC_NET_BLOCK_MAX_DECODED, devc->limit_samples - network->offset);
+        }
+        else
+        {
+            command.opcode = network->stop_requested ? xLOGIC_NET_OP_STOP : xLOGIC_NET_OP_RELEASE;
+        }
+        if (xESK_Logic_Network_Request_Encode(&command, &request) != xRETURN_OK)
+        {
+            return SR_ERR;
+        }
+    }
+    if (xSDK_xESK_Network_Queue(network->esk, &request) != xRETURN_OK)
+    {
+        return SR_ERR;
+    }
+    network->esk_phase = phase;
+    network->active_deadline = g_get_monotonic_time() + xSDK_xLOGIC_NET_TIMEOUT_US;
+    network->progressed = TRUE;
+    return SR_OK;
+}
+
+static int esk_publish_block(struct sr_dev_inst *sdi)
+{
+    struct dev_context *devc = sdi->priv;
+    struct xsdk_xlogic_network *network = devc->network;
+    const size_t bytes = network->esk->block_bytes;
+    const gboolean publish = !network->stop_requested;
+    const struct sr_datafeed_logic logic = {.length = bytes, .unitsize = 1U, .data = network->esk->block};
+    const struct sr_datafeed_packet packet = {.type = SR_DF_LOGIC, .payload = &logic};
+    if (bytes == 0U || bytes > devc->limit_samples - network->offset)
+    {
+        return SR_ERR;
+    }
+    if (publish && sr_session_send(sdi, &packet) != SR_OK)
+    {
+        return SR_ERR;
+    }
+    if (devc->acquisition_state == xSDK_xLOGIC_ACQ_IDLE)
+    {
+        return SR_OK;
+    }
+    network->offset += bytes;
+    devc->sent_samples += publish ? bytes : 0U;
+    return SR_OK;
+}
+
+static int esk_consume_control(struct sr_dev_inst *sdi, gint64 now)
+{
+    struct dev_context *devc = sdi->priv;
+    struct xsdk_xlogic_network *network = devc->network;
+    xSDK_xESK_Network_Pump_t *pump = network->esk;
+    if (network->esk_phase == xSDK_xESK_PHASE_RENEW)
+    {
+        network->esk_renew_at = now + 10 * G_TIME_SPAN_SECOND;
+        network->esk_phase = network->esk_resume;
+        return SR_OK;
+    }
+    if (network->esk_phase == xSDK_xESK_PHASE_CLAIM)
+    {
+        network->esk_renew_at = now + 10 * G_TIME_SPAN_SECOND;
+        network->esk_phase = network->stop_requested ? xSDK_xESK_PHASE_RELEASE : xSDK_xESK_PHASE_START;
+        return SR_OK;
+    }
+    if (network->esk_phase == xSDK_xESK_PHASE_REAP)
+    {
+        network_finish(sdi, FALSE);
+        return SR_OK;
+    }
+    if (network->esk_phase == xSDK_xESK_PHASE_RELEASE)
+    {
+        if (pump->session.safe_to_reap)
+        {
+            network->esk_phase = xSDK_xESK_PHASE_REAP;
+        }
+        else
+        {
+            network->poll_after = now + 50 * G_TIME_SPAN_MILLISECOND;
+        }
+        return SR_OK;
+    }
+    return SR_ERR;
+}
+
+static int esk_consume_service(struct sr_dev_inst *sdi, gint64 now)
+{
+    struct dev_context *devc = sdi->priv;
+    struct xsdk_xlogic_network *network = devc->network;
+    xSDK_xESK_Network_Pump_t *pump = network->esk;
+    const uint32_t status = RL32(pump->reply.payload.data + 12U);
+    if (network->esk_phase == xSDK_xESK_PHASE_FINISH && status == xLOGIC_NET_STATUS_BUSY)
+    {
+        network->poll_after = now + 50 * G_TIME_SPAN_MILLISECOND;
+        return SR_OK;
+    }
+    if (status != xLOGIC_NET_STATUS_OK)
+    {
+        return SR_ERR;
+    }
+    if (network->esk_phase == xSDK_xESK_PHASE_FINISH)
+    {
+        network->esk_phase = xSDK_xESK_PHASE_RELEASE;
+    }
+    else if (network->esk_phase == xSDK_xESK_PHASE_READ)
+    {
+        if (esk_publish_block(sdi) != SR_OK || devc->acquisition_state == xSDK_xLOGIC_ACQ_IDLE)
+        {
+            return devc->acquisition_state == xSDK_xLOGIC_ACQ_IDLE ? SR_OK : SR_ERR;
+        }
+        network->esk_phase =
+            network->stop_requested || network->offset == devc->limit_samples ? xSDK_xESK_PHASE_FINISH : xSDK_xESK_PHASE_READ;
+    }
+    else if ((RL16(pump->reply.payload.data + 16U) & xLOGIC_NET_FLAG_FAILED) != 0U)
+    {
+        return SR_ERR;
+    }
+    else
+    {
+        network->esk_phase = pump->session.capture_ready ? xSDK_xESK_PHASE_READ : xSDK_xESK_PHASE_STATUS;
+        network->poll_after = pump->session.capture_ready ? 0 : now + 100 * G_TIME_SPAN_MILLISECOND;
+        if (pump->session.capture_ready)
+        {
+            send_rate(sdi, pump->session.capture.sample_rate);
+        }
+    }
+    return SR_OK;
+}
+
+static int esk_consume(struct sr_dev_inst *sdi)
+{
+    struct xsdk_xlogic_network *network = ((struct dev_context *)sdi->priv)->network;
+    if (network->esk->reply.status != xESK_CONTROL_OK)
+    {
+        return SR_ERR;
+    }
+    const gint64 now = g_get_monotonic_time();
+    return network->esk->reply.opcode == xESK_CONTROL_SERVICE ? esk_consume_service(sdi, now) : esk_consume_control(sdi, now);
+}
+
+static int esk_retirement(struct xsdk_xlogic_network *network, gint64 now)
+{
+    xSDK_xESK_Network_Pump_t *pump = network->esk;
+    if (network->esk_retire_deadline != 0 && now >= network->esk_retire_deadline)
+    {
+        return SR_ERR;
+    }
+    if (network->stop_requested && pump->session.session_id != 0U && !pump->session.retiring)
+    {
+        network->esk_phase = pump->session.has_capture ? xSDK_xESK_PHASE_FINISH : xSDK_xESK_PHASE_RELEASE;
+    }
+    if ((network->esk_phase == xSDK_xESK_PHASE_FINISH || network->esk_phase == xSDK_xESK_PHASE_RELEASE) &&
+        network->esk_retire_deadline == 0)
+    {
+        network->esk_retire_deadline = now + 5 * G_TIME_SPAN_SECOND;
+    }
+    return SR_OK;
+}
+
+static int esk_schedule(struct sr_dev_inst *sdi, gint64 now)
+{
+    struct xsdk_xlogic_network *network = ((struct dev_context *)sdi->priv)->network;
+    xSDK_xESK_Network_Pump_t *pump = network->esk;
+    if (esk_retirement(network, now) != SR_OK)
+    {
+        return SR_ERR;
+    }
+    if (network->esk_phase == xSDK_xESK_PHASE_STATUS && now >= network->esk_capture_deadline)
+    {
+        return SR_ERR;
+    }
+    if (network->poll_after != 0 && now < network->poll_after)
+    {
+        return SR_ERR_NA;
+    }
+    network->poll_after = 0;
+    if (pump->session.session_id != 0U && !pump->session.retiring && now >= network->esk_renew_at &&
+        network->esk_phase != xSDK_xESK_PHASE_FINISH && network->esk_phase != xSDK_xESK_PHASE_RELEASE)
+    {
+        network->esk_resume = network->esk_phase;
+        return esk_queue_phase(sdi, xSDK_xESK_PHASE_RENEW);
+    }
+    return esk_queue_phase(sdi, network->esk_phase);
+}
+
+static int esk_advance(struct sr_dev_inst *sdi)
+{
+    struct xsdk_xlogic_network *network = ((struct dev_context *)sdi->priv)->network;
+    xSDK_xESK_Network_Pump_t *pump = network->esk;
+    const gint64 now = g_get_monotonic_time();
+    network->progressed = FALSE;
+    if (!pump->active)
+    {
+        return esk_schedule(sdi, now);
+    }
+    if (now >= network->active_deadline)
+    {
+        xSDK_xESK_Network_Poison(&pump->session);
+        return SR_ERR;
+    }
+    const xRETURN_t status = xSDK_xESK_Network_Pump(pump, network, esk_write, esk_read);
+    return status == xRETURN_OK ? esk_consume(sdi) : (status == xRETURN_xERR_xESK_BUSY ? SR_ERR_NA : SR_ERR);
+}
+
 static gboolean network_event_source(int fd, int revents, void *cb_data)
 {
     struct sr_dev_inst *sdi = cb_data;
@@ -1146,7 +1495,7 @@ static gboolean network_event_source(int fd, int revents, void *cb_data)
      * fast socket into an unbounded session callback. */
     for (step = 0U; step < xSDK_xLOGIC_NET_PUMP_STEPS && completed < xSDK_xLOGIC_NET_CREDITS; step++)
     {
-        int result = advance_network(sdi);
+        int result = network->esk ? esk_advance(sdi) : advance_network(sdi);
 
         if (result != SR_OK && result != SR_ERR_NA)
         {
@@ -1264,31 +1613,34 @@ static const char *connection_host(const char *host, char resolved[16])
     return host;
 }
 
+static gboolean connection_parse(char **fields, uint32_t *credits, gboolean *explicit_window, gboolean *esk)
+{
+    char *end = NULL;
+    if (!connection_window_parse(fields, credits, explicit_window))
+    {
+        return FALSE;
+    }
+    *esk = strcmp(fields[0], "tcp-xesk") == 0;
+    if ((!*esk && strcmp(fields[0], "tcp-raw") != 0) || (*esk && *explicit_window) || fields[1][0] == '\0' || fields[2][0] == '\0')
+    {
+        return FALSE;
+    }
+    const guint64 port = g_ascii_strtoull(fields[2], &end, 10);
+    return *end == '\0' && port != 0U && port <= 65535U;
+}
+
 static struct xsdk_xlogic_network *network_new(const char *connection)
 {
     struct xsdk_xlogic_network *network = NULL;
     char **fields = g_strsplit(connection, "/", 0);
-    char *end = NULL;
-    guint64 port;
     uint32_t credits;
-    gboolean explicit_window;
+    gboolean explicit_window, esk;
     char resolved[16];
-    const char *host;
-
-    if (!connection_window_parse(fields, &credits, &explicit_window))
+    if (!connection_parse(fields, &credits, &explicit_window, &esk))
     {
         goto done;
     }
-    if (strcmp(fields[0], "tcp-raw") != 0 || fields[1][0] == '\0' || fields[2][0] == '\0')
-    {
-        goto done;
-    }
-    port = g_ascii_strtoull(fields[2], &end, 10);
-    if (*end != '\0' || port == 0U || port > 65535U)
-    {
-        goto done;
-    }
-    host = connection_host(fields[1], resolved);
+    const char *host = connection_host(fields[1], resolved);
     if (!host)
     {
         goto done;
@@ -1306,13 +1658,15 @@ static struct xsdk_xlogic_network *network_new(const char *connection)
     network->credits = xSDK_xLOGIC_NET_CREDITS;
     network->accepted_credits = xSDK_xLOGIC_NET_CREDITS;
     network->peer = sr_tcp_dev_inst_new(host, fields[2]);
+    network->esk = esk ? g_try_new0(xSDK_xESK_Network_Pump_t, 1U) : NULL;
     network->response = g_try_malloc(xSDK_xLOGIC_NET_RESPONSE_BYTES + xSDK_xLOGIC_NET_MAX_BLOCK);
     network->decoded = g_try_malloc(xLOGIC_NET_BLOCK_MAX_DECODED);
-    if (!network->peer || !network->response || !network->decoded)
+    if (!network->peer || (esk && !network->esk) || !network->response || !network->decoded)
     {
         sr_tcp_dev_inst_free(network->peer);
         g_free(network->response);
         g_free(network->decoded);
+        g_free(network->esk);
         g_free(network);
         network = NULL;
     }
@@ -1344,6 +1698,7 @@ SR_PRIV void xsdk_xlogic_network_clear(struct dev_context *devc)
     sr_tcp_dev_inst_free(devc->network->peer);
     g_free(devc->network->response);
     g_free(devc->network->decoded);
+    g_free(devc->network->esk);
     g_free(devc->network);
     devc->network = NULL;
 }
@@ -1381,7 +1736,7 @@ static struct sr_dev_inst *network_device(const char *connection, const struct x
         result = network_connect(network);
         if (result == SR_OK)
         {
-            result = exchange_caps(network);
+            result = network->esk ? esk_describe(network) : exchange_caps(network);
         }
         sr_tcp_disconnect(network->peer);
     }
@@ -1392,16 +1747,20 @@ static struct sr_dev_inst *network_device(const char *connection, const struct x
         return NULL;
     }
     devc->limit_samples = MIN((uint64_t)6144U, network->maximum_samples);
-    devc->rates[0].request = xSDK_xLOGIC_NET_SAMPLE_RATE;
-    devc->rates[0].actual = xSDK_xLOGIC_NET_SAMPLE_RATE;
-    devc->rates[0].stream_format = xSDK_xLOGIC_STREAM_FORMAT_U8;
-    devc->rate_count = 1U;
+    devc->rate_count = network->esk ? xESK_LOGIC_RATE_PROFILE_1_COUNT : 1U;
+    for (unsigned int index = 0U; index < devc->rate_count; ++index)
+    {
+        const uint32_t rate = network->esk ? xESK_Logic_Rate_Profile_1(index) : xSDK_xLOGIC_NET_SAMPLE_RATE;
+        devc->rates[index].request = rate;
+        devc->rates[index].actual = rate;
+        devc->rates[index].stream_format = xSDK_xLOGIC_STREAM_FORMAT_U8;
+    }
     sdi = g_malloc0(sizeof(*sdi));
     sdi->status = SR_ST_INACTIVE;
     sdi->inst_type = SR_INST_USER;
     sdi->vendor = g_strdup("xSDK");
-    sdi->model =
-        discovered ? g_strdup_printf("%s (%s)", discovered->instance, discovered->board) : g_strdup("xLOGIC Ethernet DDR (experimental)");
+    sdi->model = discovered ? g_strdup_printf("%s (%s)", discovered->instance, discovered->board)
+                            : g_strdup(network->esk ? "xESK finite Ethernet" : "xLOGIC Ethernet DDR (experimental)");
     sdi->serial_num = discovered ? g_strdup(discovered->identity) : NULL;
     sdi->connection_id = g_strdup(connection);
     sdi->priv = devc;
@@ -1456,7 +1815,7 @@ SR_PRIV int xsdk_xlogic_network_open(struct sr_dev_inst *sdi)
     {
         return result;
     }
-    result = exchange_caps(devc->network);
+    result = devc->network->esk ? esk_describe(devc->network) : exchange_caps(devc->network);
     if (result != SR_OK)
     {
         sr_tcp_disconnect(devc->network->peer);
@@ -1488,8 +1847,12 @@ static const char *const retrieval_sources[] = {
     "raw", "block-raw", "rle", "rle-strict", "palette", "palette-strict", "active", "active-strict", "nibble", "nibble-strict", "auto",
 };
 
-SR_PRIV GVariant *xsdk_xlogic_network_sources(void)
+SR_PRIV GVariant *xsdk_xlogic_network_sources(const struct dev_context *devc)
 {
+    if (devc->network->esk)
+    {
+        return g_variant_new_strv(retrieval_sources, 1U);
+    }
     return g_variant_new_strv(retrieval_sources, G_N_ELEMENTS(retrieval_sources));
 }
 
@@ -1502,6 +1865,11 @@ SR_PRIV int xsdk_xlogic_network_source_set(struct dev_context *devc, const char 
 {
     size_t index;
     struct xsdk_xlogic_network *network = devc->network;
+
+    if (network->esk && strcmp(source, "raw") != 0)
+    {
+        return SR_ERR_ARG;
+    }
 
     for (index = 0U; index < G_N_ELEMENTS(retrieval_sources); index++)
     {
@@ -1526,7 +1894,16 @@ SR_PRIV uint64_t xsdk_xlogic_network_limit(const struct dev_context *devc)
 
 SR_PRIV gboolean xsdk_xlogic_network_depth_valid(const struct dev_context *devc, uint64_t samples)
 {
-    return samples != 0U && samples <= devc->network->maximum_samples;
+    if (samples == 0U || samples > devc->network->maximum_samples)
+    {
+        return FALSE;
+    }
+    if (devc->network->esk)
+    {
+        const uint64_t quantum = devc->rates[devc->rate_index].actual == 500000000U ? 192U : 64U;
+        return ((samples + quantum - 1U) / quantum) * quantum <= devc->network->maximum_samples;
+    }
+    return TRUE;
 }
 
 static int configure_retrieval_window(struct dev_context *devc)
@@ -1572,14 +1949,67 @@ static int configure_retrieval_window(struct dev_context *devc)
     return SR_OK;
 }
 
+static int esk_start(struct sr_dev_inst *sdi)
+{
+    struct dev_context *devc = sdi->priv;
+    struct xsdk_xlogic_network *network = devc->network;
+    const uint64_t quantum = devc->rates[devc->rate_index].actual == 500000000U ? 192U : 64U;
+    network->rounded_samples = ((devc->limit_samples + quantum - 1U) / quantum) * quantum;
+    network->offset = 0U;
+    network->poll_after = 0;
+    network->esk_retire_deadline = 0;
+    network->esk_capture_deadline = g_get_monotonic_time() + 70 * G_TIME_SPAN_SECOND;
+    network->stop_requested = FALSE;
+    if (network_source_add(sdi) != SR_OK)
+    {
+        return SR_ERR;
+    }
+    devc->acquisition_state = xSDK_xLOGIC_ACQ_RUNNING;
+    devc->sent_samples = 0U;
+    devc->end_sent = FALSE;
+    devc->failed = FALSE;
+    std_session_send_df_header(sdi);
+    if (esk_queue_phase(sdi, xSDK_xESK_PHASE_CLAIM) != SR_OK)
+    {
+        network_finish(sdi, TRUE);
+        return SR_ERR;
+    }
+    return SR_OK;
+}
+
 SR_PRIV int xsdk_xlogic_network_start(struct sr_dev_inst *sdi)
 {
     struct dev_context *devc = sdi->priv;
     struct xsdk_xlogic_network *network = devc->network;
     int result;
 
-    if (devc->acquisition_state != xSDK_xLOGIC_ACQ_IDLE || devc->continuous ||
-        !xsdk_xlogic_network_depth_valid(devc, devc->limit_samples) || network->peer->sock_fd < 0)
+    if (devc->acquisition_state != xSDK_xLOGIC_ACQ_IDLE || devc->continuous || devc->limit_samples == 0U)
+    {
+        return SR_ERR_ARG;
+    }
+    if (network->esk)
+    {
+        // The device may retire an idle control connection while the user is
+        // configuring the frontend. Reconnect only before acquiring a grant;
+        // esk_describe rejects a different board or boot instead of replaying.
+        sr_tcp_disconnect(network->peer);
+        if (network_connect(network) != SR_OK)
+        {
+            return SR_ERR;
+        }
+        if (esk_describe(network) != SR_OK)
+        {
+            sr_tcp_disconnect(network->peer);
+            return SR_ERR;
+        }
+        if (!xsdk_xlogic_network_depth_valid(devc, devc->limit_samples))
+        {
+            sr_tcp_disconnect(network->peer);
+            return SR_ERR_ARG;
+        }
+        return esk_start(sdi);
+    }
+    if (!xsdk_xlogic_network_depth_valid(devc, devc->limit_samples) || network->peer->sock_fd < 0)
     {
         return SR_ERR_ARG;
     }

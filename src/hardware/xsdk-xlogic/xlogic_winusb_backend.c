@@ -9,7 +9,7 @@
 #include <config.h>
 #include <string.h>
 #include "xlogic_winusb_backend.h"
-#include "xlogic_capture_winusb.h"
+#include "xlogic_winusb_worker.h"
 
 /* Process lifetime, serialized across this driver. The head/count are fixed storage;
  * at most 64 registered owners (active, retained, or closure tombstones) exist.
@@ -17,13 +17,13 @@
  * outlives GUI/session teardown when native I/O cannot yet be destroyed.
  * Normal PulseView transfers ownership UI -> sampling thread -> joined UI.
  * Concurrent independent libsigrok sessions/discovery need external process-wide
- * serialization. No thread, pumping allocation, or DLL-unload guarantee exists. */
+ * serialization. Native capture is owned by a dedicated worker. */
 #define xSDK_xLOGIC_WINUSB_OWNER_LIMIT 64U
 
 struct xsdk_xlogic_winusb_owner
 {
     struct xsdk_xlogic_winusb_owner *next;
-    xLOGIC_Capture_WinUSB_Handle_t *capture;
+    xsdk_xlogic_winusb_worker *worker;
     struct sr_dev_inst *sdi;
     GSource *source; /* Borrowed from the main context; no extra reference. */
     gunichar2 *path;
@@ -32,12 +32,12 @@ struct xsdk_xlogic_winusb_owner
     size_t serial_units;
     uint8_t *decode_buffer;
     size_t decode_buffer_bytes;
+    uint64_t frontend_wire_bytes;
     unsigned call_depth;
     gboolean is_bound;
     gboolean is_registered;
     gboolean is_tombstone;
     gboolean is_detached;
-    gboolean in_core;
     gboolean has_header;
     gboolean has_metadata;
     gboolean has_end;
@@ -65,7 +65,7 @@ static gboolean frontend_present(const struct xsdk_xlogic_winusb_owner *owner)
 
 static void free_unbound_owner(struct xsdk_xlogic_winusb_owner *owner)
 {
-    if (owner->is_bound || owner->is_registered || owner->capture || owner->source || owner->call_depth)
+    if (owner->is_bound || owner->is_registered || owner->worker || owner->source || owner->call_depth)
     {
         return;
     }
@@ -134,8 +134,8 @@ static int register_owner(struct xsdk_xlogic_winusb_owner *owner)
 
 static void report_error(const char *operation, const xLOGIC_Capture_Error_t *error)
 {
-    sr_err("xLOGIC %s failed: result=%u stage=%u native=%u (present=%u).", operation, (unsigned)error->result, (unsigned)error->stage,
-           error->native_error, error->has_native_error);
+    sr_err("xLOGIC %s failed: result=%u stage=%u native=%u (present=%u) sink=%u.", operation, (unsigned)error->result,
+           (unsigned)error->stage, error->native_error, error->has_native_error, error->sink_error);
 }
 
 static void log_capture_snapshot(const struct xsdk_xlogic_winusb_owner *owner, const xLOGIC_Capture_Snapshot_t *snapshot, const char *point)
@@ -178,31 +178,19 @@ static void log_first_error_snapshot(struct xsdk_xlogic_winusb_owner *owner, con
     log_capture_snapshot(owner, snapshot, "first-error");
 }
 
-static int destroy_terminal(struct xsdk_xlogic_winusb_owner *owner, const xLOGIC_Capture_Snapshot_t *snapshot)
+static int destroy_terminal(struct xsdk_xlogic_winusb_owner *owner, const xsdk_xlogic_worker_status *status)
 {
-    xLOGIC_Capture_Error_t error = {0};
-    xLOGIC_Capture_Result_t result;
-    gboolean remote_uncertain;
-
-    if (!snapshot->can_destroy)
+    if (!status->thread_exited || !status->native_disposed || !xsdk_xlogic_worker_destroy(&owner->worker))
     {
         return SR_ERR;
     }
-    remote_uncertain =
-        snapshot->has_unconfirmed_control || (snapshot->phase == xLOGIC_CAPTURE_TERMINAL &&
-                                              (snapshot->has_started || snapshot->connection_id != 0U) && !snapshot->service_retired);
-    result = xLOGIC_Capture_WinUSB_Destroy(&owner->capture, &error);
-    if (owner->capture)
-    {
-        return SR_ERR;
-    }
-    if (result != xLOGIC_CAPTURE_OK || remote_uncertain)
+    if (!status->native_retired)
     {
         owner->is_tombstone = TRUE;
         sr_err("xLOGIC cleanup is uncertain; serial remains quarantined for this process.");
-        if (result != xLOGIC_CAPTURE_OK)
+        if (status->close_completed && status->close_result != xLOGIC_CAPTURE_OK)
         {
-            report_error("native close", &error);
+            report_error("native close", &status->close_error);
         }
         return SR_ERR;
     }
@@ -212,27 +200,11 @@ static int destroy_terminal(struct xsdk_xlogic_winusb_owner *owner, const xLOGIC
 
 static void detach_owner(struct xsdk_xlogic_winusb_owner *owner)
 {
-    xLOGIC_Capture_Result_t result;
-
     owner->is_detached = TRUE;
     owner->sdi = NULL;
-    if (!owner->capture)
+    if (owner->worker)
     {
-        return;
-    }
-    if (owner->in_core)
-    {
-        /* Request_Stop is the sole reentrant core API. GUI pointers are already
-         * unreachable; clearing the core callback binding follows Step return. */
-        result = xLOGIC_Capture_WinUSB_Request_Stop(owner->capture);
-    }
-    else
-    {
-        result = xLOGIC_Capture_WinUSB_Detach(owner->capture);
-    }
-    if (result != xLOGIC_CAPTURE_OK)
-    {
-        sr_err("xLOGIC detach remains pending (%u).", (unsigned)result);
+        xsdk_xlogic_worker_detach(owner->worker);
     }
 }
 
@@ -248,29 +220,23 @@ static void poll_retained(void)
     while (owner)
     {
         struct xsdk_xlogic_winusb_owner *next = owner->next;
-        xLOGIC_Capture_Snapshot_t snapshot;
-        xLOGIC_Capture_Result_t result;
+        xsdk_xlogic_worker_status status;
 
-        if (owner->capture && owner->is_detached && !owner->source && !owner->in_core && owner->call_depth == 0U)
+        if (owner->worker && owner->is_detached && !owner->source && owner->call_depth == 0U)
         {
             owner->call_depth++;
-            result = xLOGIC_Capture_WinUSB_Step(owner->capture);
-            if (result != xLOGIC_CAPTURE_OK)
+            xsdk_xlogic_worker_status_get(owner->worker, &status);
+            if (status.has_snapshot)
             {
-                sr_dbg("Retained xLOGIC step result %u.", (unsigned)result);
-            }
-            result = xLOGIC_Capture_WinUSB_Snapshot(owner->capture, &snapshot);
-            if (result == xLOGIC_CAPTURE_OK)
-            {
-                log_first_error_snapshot(owner, &snapshot);
-                if (snapshot.can_destroy)
+                log_first_error_snapshot(owner, &status.snapshot);
+                if (status.thread_exited && (status.snapshot.has_started || owner->has_error_snapshot))
                 {
-                    if (snapshot.has_started || owner->has_error_snapshot)
-                    {
-                        log_capture_snapshot(owner, &snapshot, "terminal");
-                    }
-                    (void)destroy_terminal(owner, &snapshot); /* Uncertainty stays registered. */
+                    log_capture_snapshot(owner, &status.snapshot, "terminal");
                 }
+            }
+            if (status.thread_exited)
+            {
+                (void)destroy_terminal(owner, &status); /* Uncertainty stays registered. */
             }
             owner->call_depth--;
             free_unbound_owner(owner);
@@ -462,13 +428,12 @@ SR_PRIV int xsdk_xlogic_winusb_open(struct sr_dev_inst *sdi)
     struct dev_context *devc = sdi->priv;
     struct xsdk_xlogic_winusb_owner *owner = devc->winusb;
     xLOGIC_Capture_Discovery_Info_t selected;
-    xLOGIC_Capture_Error_t error = {0};
+    xsdk_xlogic_worker_status status = {0};
     xLOGIC_WINUSB_Caps_t caps;
-    xLOGIC_Capture_Result_t result;
     int ret;
 
     poll_retained();
-    if (!owner || owner->capture || owner->source || owner->is_tombstone)
+    if (!owner || owner->worker || owner->source || owner->is_tombstone)
     {
         return SR_ERR;
     }
@@ -483,37 +448,55 @@ SR_PRIV int xsdk_xlogic_winusb_open(struct sr_dev_inst *sdi)
     selected.device_path_units = owner->path_units;
     selected.serial = owner->serial;
     selected.serial_units = owner->serial_units;
-    result = xLOGIC_Capture_WinUSB_Open(&selected, &owner->capture, &error);
-    if (result != xLOGIC_CAPTURE_OK)
+    owner->worker = xsdk_xlogic_worker_open(&selected, &caps, &status);
+    if (!owner->worker || status.open_result != xLOGIC_CAPTURE_OK)
     {
-        report_error("open", &error);
+        if (!owner->worker)
+        {
+            sr_err("xLOGIC could not create its USB worker.");
+        }
+        else if (status.has_open_error)
+        {
+            report_error("open", &status.open_error);
+        }
+        else
+        {
+            sr_err("xLOGIC open/capabilities failed (%u).", (unsigned)status.open_result);
+        }
         (void)xsdk_xlogic_winusb_close(sdi); /* Failed ownership remains registered. */
         return SR_ERR;
     }
-    result = xLOGIC_Capture_WinUSB_Get_Caps(owner->capture, &caps);
-    if (result == xLOGIC_CAPTURE_OK)
+    ret = apply_caps(devc, &caps);
+    if (ret == SR_OK)
     {
-        ret = apply_caps(devc, &caps);
-        if (ret == SR_OK)
-        {
-            /* Packet storage must outlive reentrant device clear throughout
-             * sr_session_send, including the remaining datafeed callbacks. */
-            g_free(owner->decode_buffer);
-            owner->decode_buffer = devc->decode_buffer;
-            owner->decode_buffer_bytes = devc->decode_buffer_bytes;
-            devc->decode_buffer = NULL;
-            devc->decode_buffer_bytes = 0U;
-        }
-    }
-    else
-    {
-        ret = SR_ERR;
+        /* Packet storage must outlive reentrant device clear throughout
+         * sr_session_send, including the remaining datafeed callbacks. */
+        g_free(owner->decode_buffer);
+        owner->decode_buffer = devc->decode_buffer;
+        owner->decode_buffer_bytes = devc->decode_buffer_bytes;
+        devc->decode_buffer = NULL;
+        devc->decode_buffer_bytes = 0U;
     }
     if (ret != SR_OK)
     {
         (void)xsdk_xlogic_winusb_close(sdi);
     }
     return ret;
+}
+
+static void unpack_samples(uint8_t *samples, const uint8_t *data, size_t count, unsigned shift)
+{
+    size_t i;
+    for (i = 0; i < count / 2U; ++i)
+    {
+        const uint8_t value = data[i];
+        samples[2U * i] = (uint8_t)((value & 15U) << shift);
+        samples[2U * i + 1U] = (uint8_t)((value >> 4U) << shift);
+    }
+    if (count & 1U)
+    {
+        samples[count - 1U] = (uint8_t)((data[i] & 15U) << shift);
+    }
 }
 
 static xLOGIC_Capture_Sink_Result_t receive_wire(void *user, const uint8_t *data, size_t bytes, uint64_t sequence)
@@ -552,10 +535,7 @@ static xLOGIC_Capture_Sink_Result_t receive_wire(void *user, const uint8_t *data
     if (packed)
     {
         const unsigned shift = devc->channel_mask == xSDK_xLOGIC_PACKED_UPPER_CHANNEL_MASK ? 4U : 0U;
-        for (size_t i = 0; i < accepted; ++i)
-        {
-            owner->decode_buffer[i] = (uint8_t)(((data[i / 2U] >> ((i % 2U) * 4U)) & 15U) << shift);
-        }
+        unpack_samples(owner->decode_buffer, data, accepted, shift);
         samples = owner->decode_buffer;
     }
     devc->sent_samples += accepted;
@@ -689,10 +669,16 @@ static gboolean final_accounting_valid(struct xsdk_xlogic_winusb_owner *owner, c
         sr_err("xLOGIC completed wire reads and device transmitted bytes differ.");
         return FALSE;
     }
-    sr_info("xLOGIC wire reaped=%" G_GUINT64_FORMAT " delivered=%" G_GUINT64_FORMAT " logical=%" G_GUINT64_FORMAT
-            " cleanup canceled=%" G_GUINT64_FORMAT " failed=%" G_GUINT64_FORMAT " unresolved=%" G_GUINT64_FORMAT " accounting=%s.",
-            successful, snapshot->delivered_wire_bytes, devc->sent_samples, cleanup->canceled_reads, cleanup->failed_reads,
-            cleanup->unresolved_reads, partial ? "partial (failed/canceled extents unknown)" : "exact");
+    if (!owner->was_user_stopped && owner->frontend_wire_bytes != snapshot->delivered_wire_bytes)
+    {
+        sr_err("xLOGIC frontend did not receive all queued wire data.");
+        return FALSE;
+    }
+    sr_info("xLOGIC wire reaped=%" G_GUINT64_FORMAT " queued=%" G_GUINT64_FORMAT " delivered=%" G_GUINT64_FORMAT
+            " logical=%" G_GUINT64_FORMAT " cleanup canceled=%" G_GUINT64_FORMAT " failed=%" G_GUINT64_FORMAT
+            " unresolved=%" G_GUINT64_FORMAT " accounting=%s.",
+            successful, snapshot->delivered_wire_bytes, owner->frontend_wire_bytes, devc->sent_samples, cleanup->canceled_reads,
+            cleanup->failed_reads, cleanup->unresolved_reads, partial ? "partial (failed/canceled extents unknown)" : "exact");
     return TRUE;
 }
 
@@ -713,16 +699,23 @@ static void log_capture_statistics(const xLOGIC_Capture_Snapshot_t *snapshot)
             elapsed, snapshot->delivered_wire_bytes, (double)snapshot->delivered_wire_bytes * 1000000.0 / (double)elapsed);
 }
 
-static void finish_capture(struct xsdk_xlogic_winusb_owner *owner, const xLOGIC_Capture_Snapshot_t *snapshot)
+static void finish_capture(struct xsdk_xlogic_winusb_owner *owner, const xsdk_xlogic_worker_status *status)
 {
+    const xLOGIC_Capture_Snapshot_t *snapshot = &status->snapshot;
     int result;
 
+    if (status->pool_exhausted)
+    {
+        sr_err("xLOGIC host capture buffer pool exhausted.");
+    }
+    sr_info("xLOGIC host buffer pool high_water=%zu capacity=%zu.", status->pool_high_water, status->pool_capacity);
+    owner->has_adapter_error |= status->worker_failed || status->pool_exhausted;
     log_first_error_snapshot(owner, snapshot);
     log_capture_snapshot(owner, snapshot, "terminal");
     log_capture_statistics(snapshot);
-    if (owner->capture && snapshot->can_destroy)
+    if (owner->worker && status->thread_exited)
     {
-        result = destroy_terminal(owner, snapshot);
+        result = destroy_terminal(owner, status);
         owner->has_adapter_error |= result != SR_OK;
     }
     if (frontend_present(owner))
@@ -748,7 +741,7 @@ static void finish_capture(struct xsdk_xlogic_winusb_owner *owner, const xLOGIC_
                 "native_close_confirmed=%u.",
                 snapshot->final_status.overruns, snapshot->final_status.usb_errors, snapshot->final_status.ownership_errors,
                 snapshot->final_status.timing_errors, (unsigned)snapshot->service_retired, (unsigned)snapshot->io_terminal,
-                (unsigned)(!owner->capture && !owner->is_tombstone));
+                (unsigned)(!owner->worker && !owner->is_tombstone));
         if (!owner->has_end && owner->has_header)
         {
             owner->has_end = TRUE;
@@ -759,7 +752,7 @@ static void finish_capture(struct xsdk_xlogic_winusb_owner *owner, const xLOGIC_
             }
         }
     }
-    if (owner->capture)
+    if (owner->worker)
     {
         detach_owner(owner);
     }
@@ -767,48 +760,79 @@ static void finish_capture(struct xsdk_xlogic_winusb_owner *owner, const xLOGIC_
 
 static gboolean tick_owner(struct xsdk_xlogic_winusb_owner *owner)
 {
-    xLOGIC_Capture_Snapshot_t snapshot;
-    xLOGIC_Capture_Result_t result;
+    xsdk_xlogic_worker_status status;
     gboolean keep = TRUE;
     int ret;
 
     owner->call_depth++;
-    owner->in_core = TRUE;
-    result = xLOGIC_Capture_WinUSB_Step(owner->capture);
-    owner->in_core = FALSE;
+    xsdk_xlogic_worker_status_get(owner->worker, &status);
+    if (status.has_snapshot)
+    {
+        log_first_error_snapshot(owner, &status.snapshot);
+        ret = send_metadata(owner, &status.snapshot);
+        if (ret != SR_OK)
+        {
+            owner->has_adapter_error = TRUE;
+            log_first_error_snapshot(owner, &status.snapshot);
+            sr_err("xLOGIC samplerate metadata delivery failed.");
+            xsdk_xlogic_worker_request_stop(owner->worker, true);
+        }
+        else if (owner->has_metadata && frontend_present(owner))
+        {
+            xsdk_xlogic_worker_frontend_ready(owner->worker);
+        }
+    }
+    for (unsigned i = 0; i < 4 && frontend_present(owner) && !owner->has_adapter_error; ++i)
+    {
+        xsdk_xlogic_wire_handle handle;
+        const uint8_t *data;
+        size_t bytes;
+        uint64_t sequence;
+        xLOGIC_Capture_Sink_Result_t delivered;
+        if (!xsdk_xlogic_worker_acquire(owner->worker, &handle, &data, &bytes, &sequence))
+        {
+            break;
+        }
+        delivered = receive_wire(owner, data, bytes, sequence);
+        if (!xsdk_xlogic_worker_release(owner->worker, handle))
+        {
+            owner->has_adapter_error = TRUE;
+            xsdk_xlogic_worker_request_stop(owner->worker, true);
+        }
+        if (delivered.bytes_consumed > UINT64_MAX - owner->frontend_wire_bytes)
+        {
+            owner->has_adapter_error = TRUE;
+        }
+        else
+        {
+            owner->frontend_wire_bytes += delivered.bytes_consumed;
+        }
+        if (delivered.flow == xLOGIC_CAPTURE_FLOW_ERROR || owner->has_adapter_error)
+        {
+            owner->has_adapter_error = TRUE;
+            xsdk_xlogic_worker_request_stop(owner->worker, true);
+        }
+    }
     if (!frontend_present(owner))
-    {
-        detach_owner(owner);
-        keep = FALSE;
-    }
-    if (result != xLOGIC_CAPTURE_OK)
-    {
-        sr_dbg("xLOGIC step result %u.", (unsigned)result);
-    }
-    result = xLOGIC_Capture_WinUSB_Snapshot(owner->capture, &snapshot);
-    if (result != xLOGIC_CAPTURE_OK)
     {
         detach_owner(owner);
         keep = FALSE;
     }
     else
     {
-        log_first_error_snapshot(owner, &snapshot);
-        ret = send_metadata(owner, &snapshot);
-        if (ret != SR_OK)
+        xsdk_xlogic_worker_status_get(owner->worker, &status);
+        if ((status.thread_exited || (status.has_snapshot && status.snapshot.phase == xLOGIC_CAPTURE_RETAINED_IO)) &&
+            (xsdk_xlogic_worker_queue_drained(owner->worker) || (status.thread_exited && owner->has_adapter_error)))
         {
-            owner->has_adapter_error = TRUE;
-            log_first_error_snapshot(owner, &snapshot);
-            sr_err("xLOGIC samplerate metadata delivery failed.");
-            result = xLOGIC_Capture_WinUSB_Request_Stop(owner->capture);
-            if (result != xLOGIC_CAPTURE_OK)
+            if (status.has_snapshot)
             {
-                sr_err("xLOGIC metadata failure could not request STOP.");
+                finish_capture(owner, &status);
             }
-        }
-        if (snapshot.phase == xLOGIC_CAPTURE_TERMINAL || snapshot.phase == xLOGIC_CAPTURE_RETAINED_IO)
-        {
-            finish_capture(owner, &snapshot);
+            else
+            {
+                owner->has_adapter_error = TRUE;
+                detach_owner(owner);
+            }
             keep = FALSE;
         }
     }
@@ -851,7 +875,7 @@ static void source_finalize(GSource *base)
     {
         sr_err("xLOGIC session source finalization failed (%d).", result);
     }
-    if (owner->capture)
+    if (owner->worker)
     {
         detach_owner(owner);
     }
@@ -879,7 +903,7 @@ static int attach_source(struct xsdk_xlogic_winusb_owner *owner)
     return result;
 }
 
-static int capture_options(struct sr_dev_inst *sdi, xLOGIC_Capture_Prepare_t *options)
+static int capture_options(struct sr_dev_inst *sdi, xsdk_xlogic_worker_config *options)
 {
     struct dev_context *devc = sdi->priv;
     const struct xsdk_xlogic_rate *rate = &devc->rates[devc->rate_index];
@@ -912,17 +936,15 @@ static int capture_options(struct sr_dev_inst *sdi, xLOGIC_Capture_Prepare_t *op
     options->config.stream_format = rate->stream_format;
     options->queue_depth = xSDK_xLOGIC_TRANSFER_COUNT;
     options->transfer_bytes = xSDK_xLOGIC_DIRECT_TRANSFER_BYTES;
+    options->pool_depth = xSDK_xLOGIC_DELIVERY_POOL_COUNT;
     options->requests_raw_io = TRUE;
     options->wire_limit_bytes = devc->continuous ? 0U : packed ? devc->limit_samples / 2U + devc->limit_samples % 2U : devc->limit_samples;
-    options->sink = receive_wire;
-    options->sink_user = devc->winusb;
     return SR_OK;
 }
 
 static int begin_frontend(struct xsdk_xlogic_winusb_owner *owner)
 {
-    xLOGIC_Capture_Snapshot_t snapshot;
-    xLOGIC_Capture_Result_t result;
+    xsdk_xlogic_worker_status status;
     int ret;
 
     owner->has_header = TRUE;
@@ -931,18 +953,18 @@ static int begin_frontend(struct xsdk_xlogic_winusb_owner *owner)
     {
         return SR_ERR;
     }
-    result = xLOGIC_Capture_WinUSB_Snapshot(owner->capture, &snapshot);
-    if (result != xLOGIC_CAPTURE_OK)
+    xsdk_xlogic_worker_status_get(owner->worker, &status);
+    if (!status.has_snapshot)
     {
         return SR_ERR;
     }
     /* An immediate-ready START needs the same metadata-before-payload boundary
      * as START_PENDING. Attach the source last, including nested main loops. */
-    ret = send_metadata(owner, &snapshot);
+    ret = send_metadata(owner, &status.snapshot);
     if (ret != SR_OK || !frontend_present(owner))
     {
         owner->has_adapter_error = TRUE;
-        log_first_error_snapshot(owner, &snapshot);
+        log_first_error_snapshot(owner, &status.snapshot);
         return SR_ERR;
     }
     return attach_source(owner);
@@ -952,7 +974,7 @@ SR_PRIV int xsdk_xlogic_winusb_start(struct sr_dev_inst *sdi)
 {
     struct dev_context *devc = sdi->priv;
     struct xsdk_xlogic_winusb_owner *owner = devc->winusb;
-    xLOGIC_Capture_Prepare_t options;
+    xsdk_xlogic_worker_config options;
     xLOGIC_Capture_Result_t result;
     int ret;
 
@@ -960,7 +982,12 @@ SR_PRIV int xsdk_xlogic_winusb_start(struct sr_dev_inst *sdi)
     {
         return SR_ERR;
     }
-    if (!owner->capture)
+    if (owner->worker && owner->is_detached && !owner->call_depth)
+    {
+        xsdk_xlogic_worker_wait_exit(owner->worker, 1000U);
+        poll_retained();
+    }
+    if (!owner->worker)
     {
         ret = xsdk_xlogic_winusb_open(sdi);
         if (ret != SR_OK)
@@ -980,15 +1007,12 @@ SR_PRIV int xsdk_xlogic_winusb_start(struct sr_dev_inst *sdi)
     owner->has_adapter_error = FALSE;
     owner->has_error_snapshot = FALSE;
     owner->was_user_stopped = FALSE;
+    owner->frontend_wire_bytes = 0U;
     devc->sent_samples = 0U;
     devc->failed = FALSE;
     devc->limit_reached = FALSE;
     devc->device_streaming = options.config.sample_count == 0U;
-    result = xLOGIC_Capture_WinUSB_Prepare(owner->capture, &options);
-    if (result == xLOGIC_CAPTURE_OK)
-    {
-        result = xLOGIC_Capture_WinUSB_Start(owner->capture);
-    }
+    result = xsdk_xlogic_worker_start(owner->worker, &options);
     if (result == xLOGIC_CAPTURE_OK)
     {
         devc->acquisition_state = xSDK_xLOGIC_ACQ_RUNNING;
@@ -1000,6 +1024,11 @@ SR_PRIV int xsdk_xlogic_winusb_start(struct sr_dev_inst *sdi)
     }
     if (ret != SR_OK || !frontend_present(owner))
     {
+        if (owner->is_bound && !owner->is_detached && owner->sdi && owner->sdi->priv)
+        {
+            struct dev_context *current = owner->sdi->priv;
+            current->acquisition_state = xSDK_xLOGIC_ACQ_IDLE;
+        }
         detach_owner(owner);
         if (owner->source)
         {
@@ -1008,6 +1037,10 @@ SR_PRIV int xsdk_xlogic_winusb_start(struct sr_dev_inst *sdi)
         ret = SR_ERR;
     }
     owner->call_depth--;
+    if (ret != SR_OK && owner->worker && !owner->source && !owner->call_depth)
+    {
+        xsdk_xlogic_worker_wait_exit(owner->worker, 1000U);
+    }
     free_unbound_owner(owner);
     poll_retained();
     return ret;
@@ -1017,25 +1050,23 @@ SR_PRIV int xsdk_xlogic_winusb_stop(struct sr_dev_inst *sdi)
 {
     struct dev_context *devc = sdi->priv;
     struct xsdk_xlogic_winusb_owner *owner = devc->winusb;
-    xLOGIC_Capture_Result_t result;
 
     /* libsigrok stops every device, including one whose start was rejected. */
-    if (!owner || !owner->capture || devc->acquisition_state == xSDK_xLOGIC_ACQ_IDLE)
+    if (!owner || !owner->worker || devc->acquisition_state == xSDK_xLOGIC_ACQ_IDLE)
     {
         return SR_OK;
     }
     devc->acquisition_state = xSDK_xLOGIC_ACQ_STOPPING;
     owner->was_user_stopped = TRUE;
-    result = xLOGIC_Capture_WinUSB_Request_Stop(owner->capture);
-    return result == xLOGIC_CAPTURE_OK ? SR_OK : SR_ERR;
+    xsdk_xlogic_worker_request_stop(owner->worker, true);
+    return SR_OK;
 }
 
 SR_PRIV int xsdk_xlogic_winusb_close(struct sr_dev_inst *sdi)
 {
     struct dev_context *devc = sdi->priv;
     struct xsdk_xlogic_winusb_owner *owner = devc->winusb;
-    xLOGIC_Capture_Snapshot_t snapshot;
-    xLOGIC_Capture_Result_t result;
+    xsdk_xlogic_worker_status status;
     int ret = SR_OK;
 
     if (!owner)
@@ -1048,19 +1079,23 @@ SR_PRIV int xsdk_xlogic_winusb_close(struct sr_dev_inst *sdi)
     {
         g_source_destroy(owner->source);
     }
-    if (owner->capture && !owner->in_core)
+    if (owner->worker)
     {
-        result = xLOGIC_Capture_WinUSB_Snapshot(owner->capture, &snapshot);
-        if (result == xLOGIC_CAPTURE_OK && snapshot.can_destroy)
+        if (devc->acquisition_state == xSDK_xLOGIC_ACQ_IDLE && !owner->source && owner->call_depth == 1U)
         {
-            ret = destroy_terminal(owner, &snapshot);
+            xsdk_xlogic_worker_wait_exit(owner->worker, 1000U);
+        }
+        xsdk_xlogic_worker_status_get(owner->worker, &status);
+        if (status.thread_exited)
+        {
+            ret = destroy_terminal(owner, &status);
         }
         else
         {
             ret = SR_ERR;
         }
     }
-    else if (!owner->capture && !owner->is_tombstone)
+    else if (!owner->worker && !owner->is_tombstone)
     {
         unregister_owner(owner);
     }
