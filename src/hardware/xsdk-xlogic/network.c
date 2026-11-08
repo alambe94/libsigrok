@@ -1731,10 +1731,7 @@ static int network_probe(struct xsdk_xlogic_network *network, const struct xsdk_
     if (discovered && network->esk)
     {
         const gboolean valid = network_bind_discovery(network, discovered);
-        if (!valid)
-        {
-            return SR_ERR_ARG;
-        }
+        return valid ? SR_OK : SR_ERR_ARG;
     }
     if (discovered && !network->esk)
     {
@@ -1750,6 +1747,20 @@ static int network_probe(struct xsdk_xlogic_network *network, const struct xsdk_
     }
     const int closed = sr_tcp_disconnect(network->peer);
     return result == SR_OK ? closed : result;
+}
+
+static void network_rates_init(struct dev_context *devc)
+{
+    struct xsdk_xlogic_network *network = devc->network;
+    devc->limit_samples = MIN((uint64_t)6144U, network->maximum_samples);
+    devc->rate_count = network->esk ? xESK_LOGIC_RATE_PROFILE_1_COUNT : 1U;
+    for (unsigned int index = 0U; index < devc->rate_count; ++index)
+    {
+        const uint32_t rate = network->esk ? xESK_Logic_Rate_Profile_1(index) : xSDK_xLOGIC_NET_SAMPLE_RATE;
+        devc->rates[index].request = rate;
+        devc->rates[index].actual = rate;
+        devc->rates[index].stream_format = xSDK_xLOGIC_STREAM_FORMAT_U8;
+    }
 }
 
 static struct sr_dev_inst *network_device(const char *connection, const struct xsdk_xlogic_discovery_device *discovered)
@@ -1779,14 +1790,9 @@ static struct sr_dev_inst *network_device(const char *connection, const struct x
         g_free(devc);
         return NULL;
     }
-    devc->limit_samples = MIN((uint64_t)6144U, network->maximum_samples);
-    devc->rate_count = network->esk ? xESK_LOGIC_RATE_PROFILE_1_COUNT : 1U;
-    for (unsigned int index = 0U; index < devc->rate_count; ++index)
+    if (network->maximum_samples != 0U)
     {
-        const uint32_t rate = network->esk ? xESK_Logic_Rate_Profile_1(index) : xSDK_xLOGIC_NET_SAMPLE_RATE;
-        devc->rates[index].request = rate;
-        devc->rates[index].actual = rate;
-        devc->rates[index].stream_format = xSDK_xLOGIC_STREAM_FORMAT_U8;
+        network_rates_init(devc);
     }
     sdi = g_malloc0(sizeof(*sdi));
     sdi->status = SR_ST_INACTIVE;
@@ -1849,6 +1855,10 @@ SR_PRIV int xsdk_xlogic_network_open(struct sr_dev_inst *sdi)
         return result;
     }
     result = devc->network->esk ? esk_describe(devc->network) : exchange_caps(devc->network);
+    if (result == SR_OK && devc->network->esk && devc->rate_count == 0U)
+    {
+        network_rates_init(devc);
+    }
     if (result != SR_OK)
     {
         sr_tcp_disconnect(devc->network->peer);
