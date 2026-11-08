@@ -1984,13 +1984,30 @@ SR_PRIV int xsdk_xlogic_network_start(struct sr_dev_inst *sdi)
     int result;
 
     if (devc->acquisition_state != xSDK_xLOGIC_ACQ_IDLE || devc->continuous ||
-        !xsdk_xlogic_network_depth_valid(devc, devc->limit_samples) || network->peer->sock_fd < 0)
+        !xsdk_xlogic_network_depth_valid(devc, devc->limit_samples))
     {
         return SR_ERR_ARG;
     }
     if (network->esk)
     {
+        // The device may retire an idle control connection while the user is
+        // configuring the frontend. Reconnect only before acquiring a grant;
+        // esk_describe rejects a different board or boot instead of replaying.
+        sr_tcp_disconnect(network->peer);
+        if (network_connect(network) != SR_OK)
+        {
+            return SR_ERR;
+        }
+        if (esk_describe(network) != SR_OK)
+        {
+            sr_tcp_disconnect(network->peer);
+            return SR_ERR;
+        }
         return esk_start(sdi);
+    }
+    if (network->peer->sock_fd < 0)
+    {
+        return SR_ERR_ARG;
     }
     network->rounded_samples = ((devc->limit_samples + xSDK_xLOGIC_NET_QUANTUM - 1U) / xSDK_xLOGIC_NET_QUANTUM) * xSDK_xLOGIC_NET_QUANTUM;
     if (network->rounded_samples > network->maximum_samples)
