@@ -350,9 +350,10 @@ SR_PRIV GSList *xsdk_xlogic_winusb_scan(struct sr_dev_driver *di, const char *co
     xLOGIC_Capture_Result_t result;
     gunichar2 *serial = NULL;
     glong units = 0;
+    const gboolean usb_only = connection && !strcmp(connection, "usb");
 
     poll_retained();
-    if (connection)
+    if (connection && !usb_only)
     {
         if (!g_str_has_prefix(connection, "winusb/") || !connection[7])
         {
@@ -367,7 +368,7 @@ SR_PRIV GSList *xsdk_xlogic_winusb_scan(struct sr_dev_driver *di, const char *co
     }
     result = xLOGIC_Capture_WinUSB_Discover(serial, (size_t)units, discovered, &scan, &error);
     g_free(serial);
-    if (result != xLOGIC_CAPTURE_OK || (connection && scan.matches != 1U))
+    if (result != xLOGIC_CAPTURE_OK || (connection && !usb_only && scan.matches != 1U))
     {
         if (result != xLOGIC_CAPTURE_OK)
         {

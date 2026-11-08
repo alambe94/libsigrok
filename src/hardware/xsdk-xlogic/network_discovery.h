@@ -35,6 +35,7 @@ struct xsdk_xlogic_discovery_device
     char board[64];
     uint32_t address;
     uint16_t port, interface_index;
+    bool is_xesk;
 };
 
 size_t xsdk_xlogic_discovery_query(uint8_t *packet, size_t capacity, uint16_t id, const char *name, uint16_t type);

@@ -268,10 +268,11 @@ static bool identity_read(const struct xsdk_xlogic_discovery_record *text, struc
         return false;
     }
     valid = text_get(text, "proto", protocol, sizeof(protocol));
-    if (!valid || strcmp(protocol, "xlogic-net"))
+    if (!valid || (strcmp(protocol, "xlogic-net") && strcmp(protocol, "xesk-control")))
     {
         return false;
     }
+    device->is_xesk = strcmp(protocol, "xesk-control") == 0;
     valid = text_get(text, "wire", version, sizeof(version));
     return valid && strcmp(version, "1") == 0;
 }
@@ -367,8 +368,8 @@ device_merge(struct xsdk_xlogic_discovery_device *devices, size_t count, size_t 
         {
             // Overlapping IPv4 links cannot be selected using a numeric TCP
             // endpoint alone. Suppress the identity rather than guess a route.
-            if (devices[index].address != device->address || devices[index].port != device->port ||
-                devices[index].interface_index != device->interface_index)
+            if (devices[index].is_xesk != device->is_xesk || devices[index].address != device->address ||
+                devices[index].port != device->port || devices[index].interface_index != device->interface_index)
             {
                 devices[index].port = 0;
             }
