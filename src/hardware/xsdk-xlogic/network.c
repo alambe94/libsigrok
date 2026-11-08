@@ -92,6 +92,8 @@ struct xsdk_xlogic_network
     struct sr_tcp_dev_inst *peer;
     xSDK_xESK_Network_Pump_t *esk;
     xESK_Device_t esk_device;
+    uint8_t discovered_mac[6];
+    gboolean has_discovered_mac;
     enum xsdk_xesk_phase esk_phase;
     enum xsdk_xesk_phase esk_resume;
     gint64 esk_renew_at;
@@ -378,6 +380,11 @@ static int esk_describe(struct xsdk_xlogic_network *network)
         return SR_ERR;
     }
     const xESK_Device_t *device = &network->esk->session.device;
+    if (network->has_discovered_mac && memcmp(device->device_id + 10U, network->discovered_mac, sizeof(network->discovered_mac)) != 0)
+    {
+        sr_err("xESK discovery identity does not match the device; scan again.");
+        return SR_ERR;
+    }
     if (previous.boot_id != 0U &&
         (previous.boot_id != device->boot_id || memcmp(previous.device_id, device->device_id, sizeof(previous.device_id)) != 0))
     {
@@ -1703,6 +1710,48 @@ SR_PRIV void xsdk_xlogic_network_clear(struct dev_context *devc)
     devc->network = NULL;
 }
 
+static gboolean network_bind_discovery(struct xsdk_xlogic_network *network, const struct xsdk_xlogic_discovery_device *discovered)
+{
+    for (size_t index = 0U; index < sizeof(network->discovered_mac); ++index)
+    {
+        const int high = g_ascii_xdigit_value(discovered->identity[index * 2U]);
+        const int low = g_ascii_xdigit_value(discovered->identity[index * 2U + 1U]);
+        if (high < 0 || low < 0)
+        {
+            return FALSE;
+        }
+        network->discovered_mac[index] = (uint8_t)((high << 4) | low);
+    }
+    network->has_discovered_mac = TRUE;
+    return TRUE;
+}
+
+static int network_probe(struct xsdk_xlogic_network *network, const struct xsdk_xlogic_discovery_device *discovered)
+{
+    if (discovered && network->esk)
+    {
+        const gboolean valid = network_bind_discovery(network, discovered);
+        if (!valid)
+        {
+            return SR_ERR_ARG;
+        }
+    }
+    if (discovered && !network->esk)
+    {
+        // The legacy fixed profile is provisional until normal device open.
+        network->maximum_samples = xSDK_xLOGIC_NET_CAPACITY;
+        network->maximum_read = xSDK_xLOGIC_NET_MAX_READ;
+        return SR_OK;
+    }
+    int result = network_connect(network);
+    if (result == SR_OK)
+    {
+        result = network->esk ? esk_describe(network) : exchange_caps(network);
+    }
+    const int closed = sr_tcp_disconnect(network->peer);
+    return result == SR_OK ? closed : result;
+}
+
 static struct sr_dev_inst *network_device(const char *connection, const struct xsdk_xlogic_discovery_device *discovered)
 {
     struct xsdk_xlogic_network *network = network_new(connection);
@@ -1723,23 +1772,7 @@ static struct sr_dev_inst *network_device(const char *connection, const struct x
         return NULL;
     }
     devc->network = network;
-    result = SR_OK;
-    if (discovered)
-    {
-        // DNS advertises identity and endpoint only. The fixed XLN1 profile is
-        // provisional until normal device open validates authoritative CAPS.
-        network->maximum_samples = xSDK_xLOGIC_NET_CAPACITY;
-        network->maximum_read = xSDK_xLOGIC_NET_MAX_READ;
-    }
-    else
-    {
-        result = network_connect(network);
-        if (result == SR_OK)
-        {
-            result = network->esk ? esk_describe(network) : exchange_caps(network);
-        }
-        sr_tcp_disconnect(network->peer);
-    }
+    result = network_probe(network, discovered);
     if (result != SR_OK)
     {
         xsdk_xlogic_network_clear(devc);
@@ -1794,8 +1827,8 @@ SR_PRIV GSList *xsdk_xlogic_network_discover(void)
         const uint8_t *address = (const uint8_t *)&discovered[index].address;
         char connection[64];
         struct sr_dev_inst *device;
-        g_snprintf(connection, sizeof(connection), "tcp-raw/%u.%u.%u.%u/%u", address[0], address[1], address[2], address[3],
-                   discovered[index].port);
+        g_snprintf(connection, sizeof(connection), "%s/%u.%u.%u.%u/%u", discovered[index].is_xesk ? "tcp-xesk" : "tcp-raw", address[0],
+                   address[1], address[2], address[3], discovered[index].port);
         device = network_device(connection, &discovered[index]);
         if (device)
         {
