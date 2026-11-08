@@ -208,7 +208,7 @@ struct dev_context
     gboolean wire_accounting_partial;
 };
 
-SR_PRIV GVariant *xsdk_xlogic_network_sources(void);
+SR_PRIV GVariant *xsdk_xlogic_network_sources(const struct dev_context *devc);
 SR_PRIV gboolean xsdk_xlogic_caps_valid(const struct xsdk_xlogic_caps_wire *wire);
 SR_PRIV const char *xsdk_xlogic_network_source(const struct dev_context *devc);
 SR_PRIV int xsdk_xlogic_network_source_set(struct dev_context *devc, const char *source);

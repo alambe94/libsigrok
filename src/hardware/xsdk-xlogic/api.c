@@ -499,7 +499,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
             conn = g_variant_get_string(src->data, NULL);
         }
     }
-    if (conn && g_str_has_prefix(conn, "tcp-raw/"))
+    if (conn && (g_str_has_prefix(conn, "tcp-raw/") || g_str_has_prefix(conn, "tcp-xesk/")))
     {
         return xsdk_xlogic_network_scan(di, conn);
     }
@@ -613,7 +613,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
             connection = g_variant_get_string(config->data, NULL);
         }
     }
-    if (connection && g_str_has_prefix(connection, "tcp-raw/"))
+    if (connection && (g_str_has_prefix(connection, "tcp-raw/") || g_str_has_prefix(connection, "tcp-xesk/")))
     {
         return xsdk_xlogic_network_scan(di, connection);
     }
@@ -897,7 +897,7 @@ static int config_list(uint32_t key, GVariant **data, const struct sr_dev_inst *
         {
             return SR_ERR_NA;
         }
-        *data = xsdk_xlogic_network_sources();
+        *data = xsdk_xlogic_network_sources(sdi->priv);
         break;
     case SR_CONF_SAMPLERATE:
         if (!sdi)
