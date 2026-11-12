@@ -49,9 +49,25 @@ static bool enums_valid(const xESK_Control_Message_t *message)
            (message->status <= xESK_CONTROL_NOT_FOUND);
 }
 
+static void header_write(const xESK_Control_Message_t *message, uint8_t *frame, size_t length)
+{
+    (void)memcpy(frame, wire_magic, sizeof(wire_magic));
+    frame[8] = xESK_CONTROL_VERSION;
+    frame[9] = message->kind;
+    frame[10] = message->opcode;
+    frame[11] = message->status;
+    xWrite_LE16(frame + 12U, (uint16_t)length);
+    xWrite_LE64(frame + 16U, message->request_id);
+    xWrite_LE64(frame + 24U, message->boot_id);
+    xWrite_LE64(frame + 32U, message->session_id);
+    xWrite_LE16(frame + 40U, message->service_id);
+    xWrite_LE16(frame + 42U, message->instance_id);
+}
+
 static xRETURN_t header_validate(const uint8_t *buffer, size_t length)
 {
-    if ((length < xESK_CONTROL_HEADER_BYTES) || (length > xESK_CONTROL_MAX_BYTES))
+    if ((length < xESK_CONTROL_HEADER_BYTES) || (length > xESK_CONTROL_SERVICE_MAX_BYTES) ||
+        ((buffer[10] != xESK_CONTROL_SERVICE) && (length > xESK_CONTROL_MAX_BYTES)))
     {
         return xRETURN_xERR_xESK_CORRUPT;
     }
@@ -155,18 +171,18 @@ xRETURN_t xESK_Control_Encode(const xESK_Control_Message_t *message, uint8_t *bu
     {
         return xRETURN_xERR_xESK_OVERFLOW;
     }
+    if (message->opcode == xESK_CONTROL_SERVICE)
+    {
+        // A copied payload cannot fail after the capacity check, so encode in
+        // place rather than through a 1 KB stack frame.
+        (void)memset(buffer, 0, xESK_CONTROL_HEADER_BYTES);
+        header_write(message, buffer, length);
+        (void)memcpy(buffer + xESK_CONTROL_HEADER_BYTES, message->payload.data, message->payload.length);
+        *written = length;
+        return xRETURN_OK;
+    }
     uint8_t frame[xESK_CONTROL_MAX_BYTES] = {0};
-    (void)memcpy(frame, wire_magic, sizeof(wire_magic));
-    frame[8] = xESK_CONTROL_VERSION;
-    frame[9] = message->kind;
-    frame[10] = message->opcode;
-    frame[11] = message->status;
-    xWrite_LE16(frame + 12U, (uint16_t)length);
-    xWrite_LE64(frame + 16U, message->request_id);
-    xWrite_LE64(frame + 24U, message->boot_id);
-    xWrite_LE64(frame + 32U, message->session_id);
-    xWrite_LE16(frame + 40U, message->service_id);
-    xWrite_LE16(frame + 42U, message->instance_id);
+    header_write(message, frame, length);
     status = xESK_Control_Payload_Encode(message, frame + xESK_CONTROL_HEADER_BYTES);
     if (status != xRETURN_OK)
     {

@@ -25,6 +25,8 @@
 #include "xlogic_network_wire.h"
 #include "xesk_network_pump.h"
 
+_Static_assert(xLOGIC_xESK_CONTROL_VERSION == xESK_CONTROL_VERSION, "the USB xESK client speaks the device's control version");
+
 #define xSDK_xLOGIC_NET_MAGIC          xLOGIC_NET_MAGIC
 #define xSDK_xLOGIC_NET_VERSION        xLOGIC_NET_VERSION
 #define xSDK_xLOGIC_NET_REQUEST_BYTES  xLOGIC_NET_REQUEST_BYTES

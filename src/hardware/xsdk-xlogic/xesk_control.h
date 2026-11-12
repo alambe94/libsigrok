@@ -22,9 +22,12 @@ extern "C"
 // PUBLIC API /////////////////////////////////////////////////////////
 
 // MACROS /////////////////////////////////////////////////////////////////////////
-#define xESK_CONTROL_VERSION      1U
+#define xESK_CONTROL_VERSION      2U
 #define xESK_CONTROL_HEADER_BYTES 48U
-#define xESK_CONTROL_MAX_BYTES    (xESK_CONTROL_HEADER_BYTES + xESK_MAX_FRAME_BYTES)
+// Every opcode except SERVICE; USB EP0 and the plane mailboxes use this bound.
+#define xESK_CONTROL_MAX_BYTES (xESK_CONTROL_HEADER_BYTES + xESK_MAX_FRAME_BYTES)
+// SERVICE frames carry one service frame; only the network route uses this bound.
+#define xESK_CONTROL_SERVICE_MAX_BYTES (xESK_CONTROL_HEADER_BYTES + xESK_SERVICE_FRAME_BYTES)
 
     // TYPES //////////////////////////////////////////////////////////////////////////
     typedef enum
@@ -81,7 +84,7 @@ extern "C"
             struct
             {
                 size_t length;
-                uint8_t data[xESK_MAX_FRAME_BYTES];
+                uint8_t data[xESK_SERVICE_FRAME_BYTES]; // SERVICE; others use at most xESK_MAX_FRAME_BYTES
             } payload;
         };
     } xESK_Control_Message_t;

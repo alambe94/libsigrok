@@ -102,6 +102,11 @@ extern "C"
 #define xRETURN_xERR_TIMEOUT     xRETURN_MAKE(0U, xRETURN_SEVERITY_ERROR, 3U)
 #define xRETURN_xERR_INVALID_ARG xRETURN_MAKE(0U, xRETURN_SEVERITY_ERROR, 4U)
 #define xRETURN_xERR_BUSY        xRETURN_MAKE(0U, xRETURN_SEVERITY_ERROR, 5U)
+// Generic driver results shared by every HAL driver; drivers add only bus errors.
+#define xRETURN_xERR_ABORTED       xRETURN_MAKE(0U, xRETURN_SEVERITY_ERROR, 6U)
+#define xRETURN_xERR_INVALID_STATE xRETURN_MAKE(0U, xRETURN_SEVERITY_ERROR, 7U)
+#define xRETURN_xERR_HARDWARE      xRETURN_MAKE(0U, xRETURN_SEVERITY_ERROR, 8U)
+#define xRETURN_xERR_UNSUPPORTED   xRETURN_MAKE(0U, xRETURN_SEVERITY_ERROR, 9U)
 
     // TYPES ///////////////////////////////////////////////////////////////////////
 

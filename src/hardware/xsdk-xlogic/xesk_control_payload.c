@@ -119,7 +119,8 @@ static bool payload_reserved_valid(const uint8_t *payload, size_t length, uint8_
 static bool service_payload_valid(const xESK_Control_Message_t *message)
 {
     return !message->has_record && message->descriptor_kind == 0U && message->index == 0U && message->expiry_policy == 0U &&
-           message->lease_ticks == 0U && message->payload.length <= xESK_MAX_FRAME_BYTES &&
+           message->lease_ticks == 0U &&
+           message->payload.length <= (message->opcode == xESK_CONTROL_SERVICE ? xESK_SERVICE_FRAME_BYTES : xESK_MAX_FRAME_BYTES) &&
            (message->kind == xESK_CONTROL_REQUEST || message->status == xESK_CONTROL_OK || message->payload.length == 0U);
 }
 
@@ -191,7 +192,7 @@ size_t xESK_Control_Payload_Size(const xESK_Control_Message_t *message)
         switch (message->record.kind)
         {
         case xESK_RECORD_SERVICE:
-            return 64U;
+            return 68U;
         case xESK_RECORD_RESOURCE:
             return 48U;
         default:
@@ -253,7 +254,7 @@ xRETURN_t xESK_Control_Payload_Decode(const uint8_t *payload, size_t length, xES
 {
     if (message->opcode == xESK_CONTROL_SERVICE || message->opcode == xESK_CONTROL_FEATURE_STATUS)
     {
-        if (length > xESK_MAX_FRAME_BYTES)
+        if (length > (message->opcode == xESK_CONTROL_SERVICE ? xESK_SERVICE_FRAME_BYTES : xESK_MAX_FRAME_BYTES))
         {
             return xRETURN_xERR_xESK_CORRUPT;
         }
