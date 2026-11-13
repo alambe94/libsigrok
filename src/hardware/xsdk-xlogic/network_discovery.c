@@ -274,7 +274,7 @@ static bool identity_read(const struct xsdk_xlogic_discovery_record *text, struc
     }
     device->is_xesk = strcmp(protocol, "xesk-control") == 0;
     valid = text_get(text, "wire", version, sizeof(version));
-    return valid && strcmp(version, device->is_xesk ? xSDK_xLOGIC_DISCOVERY_XESK_WIRE : xSDK_xLOGIC_DISCOVERY_XLOGIC_WIRE) == 0;
+    return valid && strcmp(version, device->is_xesk ? xSDK_xLOGIC_DISCOVERY_RESIDENT_WIRE : xSDK_xLOGIC_DISCOVERY_STANDALONE_WIRE) == 0;
 }
 
 static bool name_text(const xNET_DNS_Wire_Name_t *name, char *text, bool instance)

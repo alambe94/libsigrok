@@ -116,11 +116,16 @@ static bool payload_reserved_valid(const uint8_t *payload, size_t length, uint8_
     return true;
 }
 
+// SERVICE carries one service frame; FEATURE_STATUS stays within a record frame.
+static size_t payload_limit(uint8_t opcode)
+{
+    return opcode == xESK_CONTROL_SERVICE ? xESK_SERVICE_FRAME_BYTES : xESK_MAX_FRAME_BYTES;
+}
+
 static bool service_payload_valid(const xESK_Control_Message_t *message)
 {
     return !message->has_record && message->descriptor_kind == 0U && message->index == 0U && message->expiry_policy == 0U &&
-           message->lease_ticks == 0U &&
-           message->payload.length <= (message->opcode == xESK_CONTROL_SERVICE ? xESK_SERVICE_FRAME_BYTES : xESK_MAX_FRAME_BYTES) &&
+           message->lease_ticks == 0U && message->payload.length <= payload_limit(message->opcode) &&
            (message->kind == xESK_CONTROL_REQUEST || message->status == xESK_CONTROL_OK || message->payload.length == 0U);
 }
 
@@ -254,7 +259,7 @@ xRETURN_t xESK_Control_Payload_Decode(const uint8_t *payload, size_t length, xES
 {
     if (message->opcode == xESK_CONTROL_SERVICE || message->opcode == xESK_CONTROL_FEATURE_STATUS)
     {
-        if (length > (message->opcode == xESK_CONTROL_SERVICE ? xESK_SERVICE_FRAME_BYTES : xESK_MAX_FRAME_BYTES))
+        if (length > payload_limit(message->opcode))
         {
             return xRETURN_xERR_xESK_CORRUPT;
         }

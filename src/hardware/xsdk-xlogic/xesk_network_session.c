@@ -4,7 +4,7 @@
 #include "xesk_control_internal.h"
 #include <string.h>
 
-/* Discovery accepts only xSDK_xLOGIC_DISCOVERY_XESK_WIRE, "2": change both together. */
+/* Discovery accepts only xSDK_xLOGIC_DISCOVERY_RESIDENT_WIRE, "2": change both together. */
 _Static_assert(xESK_CONTROL_VERSION == 2U, "discovery accepts the control wire version this driver encodes");
 
 static bool disjoint(const void *a, size_t a_size, const void *b, size_t b_size)
