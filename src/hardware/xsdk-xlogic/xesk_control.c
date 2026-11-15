@@ -49,7 +49,31 @@ static bool enums_valid(const xESK_Control_Message_t *message)
            (message->status <= xESK_CONTROL_NOT_FOUND);
 }
 
-static void header_write(const xESK_Control_Message_t *message, uint8_t *frame, size_t length)
+static xESK_Control_Header_t message_header(const xESK_Control_Message_t *message)
+{
+    return (xESK_Control_Header_t){.kind = message->kind,
+                                   .opcode = message->opcode,
+                                   .status = message->status,
+                                   .request_id = message->request_id,
+                                   .boot_id = message->boot_id,
+                                   .session_id = message->session_id,
+                                   .service_id = message->service_id,
+                                   .instance_id = message->instance_id};
+}
+
+static xESK_Control_Header_t header_read(const uint8_t *buffer)
+{
+    return (xESK_Control_Header_t){.kind = buffer[9],
+                                   .opcode = buffer[10],
+                                   .status = buffer[11],
+                                   .request_id = xRead_LE64(buffer + 16U),
+                                   .boot_id = xRead_LE64(buffer + 24U),
+                                   .session_id = xRead_LE64(buffer + 32U),
+                                   .service_id = xRead_LE16(buffer + 40U),
+                                   .instance_id = xRead_LE16(buffer + 42U)};
+}
+
+static void header_write(const xESK_Control_Header_t *message, uint8_t *frame, size_t length)
 {
     (void)memcpy(frame, wire_magic, sizeof(wire_magic));
     frame[8] = xESK_CONTROL_VERSION;
@@ -128,6 +152,21 @@ static bool reply_payload_valid(const xESK_Control_Message_t *request, const xES
     return (request->opcode != xESK_CONTROL_CLAIM) || (request->expiry_policy == response->record.data.session.expiry_policy);
 }
 
+static bool service_header_valid(const xESK_Control_Header_t *header)
+{
+    return header->opcode == xESK_CONTROL_SERVICE && header->kind >= xESK_CONTROL_REQUEST && header->kind <= xESK_CONTROL_RESPONSE &&
+           header->status <= xESK_CONTROL_NOT_FOUND && (header->kind != xESK_CONTROL_REQUEST || header->status == xESK_CONTROL_OK) &&
+           header->request_id != 0U && header->boot_id != 0U && header->session_id != 0U && header->service_id >= xESK_SERVICE_DEVICE &&
+           header->service_id <= xESK_SERVICE_RS485;
+}
+
+static bool service_view_valid(const xESK_Control_Service_View_t *view)
+{
+    return service_header_valid(&view->header) && view->length <= xESK_SERVICE_FRAME_BYTES && (view->length == 0U || view->data != NULL) &&
+           xESK_Control_Range_Valid(view->data, view->length, 1U) &&
+           (view->header.kind == xESK_CONTROL_REQUEST || view->header.status == xESK_CONTROL_OK || view->length == 0U);
+}
+
 // PUBLIC API IMPLEMENTATION /////////////////////////////////////////////////////
 xRETURN_t xESK_Control_Validate(const xESK_Control_Message_t *message)
 {
@@ -166,6 +205,7 @@ xRETURN_t xESK_Control_Encode(const xESK_Control_Message_t *message, uint8_t *bu
     {
         return status;
     }
+    const xESK_Control_Header_t header = message_header(message);
     const size_t length = xESK_CONTROL_HEADER_BYTES + xESK_Control_Payload_Size(message);
     if (capacity < length)
     {
@@ -176,13 +216,13 @@ xRETURN_t xESK_Control_Encode(const xESK_Control_Message_t *message, uint8_t *bu
         // A copied payload cannot fail after the capacity check, so encode in
         // place rather than through a 1 KB stack frame.
         (void)memset(buffer, 0, xESK_CONTROL_HEADER_BYTES);
-        header_write(message, buffer, length);
+        header_write(&header, buffer, length);
         (void)memcpy(buffer + xESK_CONTROL_HEADER_BYTES, message->payload.data, message->payload.length);
         *written = length;
         return xRETURN_OK;
     }
     uint8_t frame[xESK_CONTROL_MAX_BYTES] = {0};
-    header_write(message, frame, length);
+    header_write(&header, frame, length);
     status = xESK_Control_Payload_Encode(message, frame + xESK_CONTROL_HEADER_BYTES);
     if (status != xRETURN_OK)
     {
@@ -263,6 +303,89 @@ xRETURN_t xESK_Control_Reply_Validate(const xESK_Control_Message_t *request, con
     {
         return xRETURN_xERR_xESK_INVALID_ARG;
     }
+    return xRETURN_OK;
+}
+
+xRETURN_t xESK_Control_Service_Decode(const uint8_t *buffer, size_t length, xESK_Control_Service_View_t *view)
+{
+    if (buffer == NULL || view == NULL)
+    {
+        return xRETURN_xERR_xESK_NULL_POINTER;
+    }
+    if (!xESK_Control_Range_Valid(buffer, length, 1U) ||
+        !xESK_Control_Range_Valid(view, sizeof(*view), _Alignof(xESK_Control_Service_View_t)) ||
+        !xESK_Control_Ranges_Disjoint(buffer, length, view, sizeof(*view)))
+    {
+        return xRETURN_xERR_xESK_INVALID_ARG;
+    }
+    const xRETURN_t status = header_validate(buffer, length);
+    if (status != xRETURN_OK)
+    {
+        return status;
+    }
+    const xESK_Control_Service_View_t candidate = {
+        .header = header_read(buffer), .data = buffer + xESK_CONTROL_HEADER_BYTES, .length = length - xESK_CONTROL_HEADER_BYTES};
+    if (!service_view_valid(&candidate))
+    {
+        return xRETURN_xERR_xESK_CORRUPT;
+    }
+    *view = candidate;
+    return xRETURN_OK;
+}
+
+xRETURN_t xESK_Control_Service_Reply_Validate(const xESK_Control_Header_t *request, const xESK_Control_Service_View_t *response)
+{
+    if (request == NULL || response == NULL)
+    {
+        return xRETURN_xERR_xESK_NULL_POINTER;
+    }
+    if (!xESK_Control_Range_Valid(request, sizeof(*request), _Alignof(xESK_Control_Header_t)) ||
+        !xESK_Control_Range_Valid(response, sizeof(*response), _Alignof(xESK_Control_Service_View_t)))
+    {
+        return xRETURN_xERR_xESK_INVALID_ARG;
+    }
+    if (!service_header_valid(request) || !service_view_valid(response))
+    {
+        return xRETURN_xERR_xESK_INVALID_ARG;
+    }
+    const xESK_Control_Header_t *reply = &response->header;
+    return request->kind == xESK_CONTROL_REQUEST && reply->kind == xESK_CONTROL_RESPONSE && request->request_id == reply->request_id &&
+                   request->session_id == reply->session_id && request->service_id == reply->service_id &&
+                   request->instance_id == reply->instance_id && (request->boot_id == reply->boot_id || reply->status == xESK_CONTROL_STALE)
+               ? xRETURN_OK
+               : xRETURN_xERR_xESK_INVALID_ARG;
+}
+
+xRETURN_t xESK_Control_Service_Encode_In_Place(const xESK_Control_Service_View_t *view, uint8_t *buffer, size_t capacity, size_t *written)
+{
+    if (view == NULL || buffer == NULL || written == NULL)
+    {
+        return xRETURN_xERR_xESK_NULL_POINTER;
+    }
+    if (!xESK_Control_Range_Valid(view, sizeof(*view), _Alignof(xESK_Control_Service_View_t)) ||
+        !xESK_Control_Range_Valid(buffer, capacity, 1U) || !xESK_Control_Range_Valid(written, sizeof(*written), _Alignof(size_t)) ||
+        !xESK_Control_Ranges_Disjoint(view, sizeof(*view), buffer, capacity) ||
+        !xESK_Control_Ranges_Disjoint(view, sizeof(*view), written, sizeof(*written)) ||
+        !xESK_Control_Ranges_Disjoint(buffer, capacity, written, sizeof(*written)))
+    {
+        return xRETURN_xERR_xESK_INVALID_ARG;
+    }
+    if (!service_view_valid(view))
+    {
+        return xRETURN_xERR_xESK_INVALID_ARG;
+    }
+    const size_t length = xESK_CONTROL_HEADER_BYTES + view->length;
+    if (capacity < length)
+    {
+        return xRETURN_xERR_xESK_OVERFLOW;
+    }
+    if (view->length != 0U && view->data != buffer + xESK_CONTROL_HEADER_BYTES)
+    {
+        return xRETURN_xERR_xESK_INVALID_ARG;
+    }
+    (void)memset(buffer, 0, xESK_CONTROL_HEADER_BYTES);
+    header_write(&view->header, buffer, length);
+    *written = length;
     return xRETURN_OK;
 }
 
