@@ -6,6 +6,11 @@
 #include <stdint.h>
 #include "xnet_dns_wire.h"
 
+/* The wire version each advertised protocol must carry. The xESK one is
+   xESK_CONTROL_VERSION, checked where the driver encodes control frames. */
+#define xSDK_xLOGIC_DISCOVERY_STANDALONE_WIRE "1"
+#define xSDK_xLOGIC_DISCOVERY_RESIDENT_WIRE   "2"
+
 #define xSDK_xLOGIC_DISCOVERY_NAME    256U
 #define xSDK_xLOGIC_DISCOVERY_RECORDS 128U
 #define xSDK_xLOGIC_DISCOVERY_DEVICES 32U

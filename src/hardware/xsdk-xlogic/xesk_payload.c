@@ -50,6 +50,7 @@ static void encode_service(const xESK_Service_t *model, uint8_t *bytes)
     xWrite_LE32(bytes + 44U, model->timebase_id);
     xWrite_LE16(bytes + 48U, model->requirement_count);
     xWrite_LE16(bytes + 50U, 0U);
+    xWrite_LE32(bytes + 52U, model->max_operation_ms);
 }
 
 static void decode_service(const uint8_t *bytes, xESK_Service_t *model)
@@ -65,6 +66,7 @@ static void decode_service(const uint8_t *bytes, xESK_Service_t *model)
     model->buffer_bytes = xRead_LE64(bytes + 36U);
     model->timebase_id = xRead_LE32(bytes + 44U);
     model->requirement_count = xRead_LE16(bytes + 48U);
+    model->max_operation_ms = xRead_LE32(bytes + 52U);
 }
 
 static void encode_resource(const xESK_Resource_t *model, uint8_t *bytes)
@@ -223,7 +225,7 @@ size_t xESK_Payload_Size(uint8_t kind)
     case xESK_RECORD_OUTCOME:
         return 40U;
     case xESK_RECORD_SERVICE:
-        return 52U;
+        return 56U;
     case xESK_RECORD_RESOURCE:
         return 36U;
     case xESK_RECORD_STREAM:

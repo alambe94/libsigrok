@@ -22,9 +22,12 @@ extern "C"
 // PUBLIC API /////////////////////////////////////////////////////////
 
 // MACROS /////////////////////////////////////////////////////////////////////////
-#define xESK_CONTROL_VERSION      1U
+#define xESK_CONTROL_VERSION      2U
 #define xESK_CONTROL_HEADER_BYTES 48U
-#define xESK_CONTROL_MAX_BYTES    (xESK_CONTROL_HEADER_BYTES + xESK_MAX_FRAME_BYTES)
+// Every opcode except SERVICE; USB EP0 and the plane mailboxes use this bound.
+#define xESK_CONTROL_MAX_BYTES (xESK_CONTROL_HEADER_BYTES + xESK_MAX_FRAME_BYTES)
+// SERVICE frames carry one service frame; only the network route uses this bound.
+#define xESK_CONTROL_SERVICE_MAX_BYTES (xESK_CONTROL_HEADER_BYTES + xESK_SERVICE_FRAME_BYTES)
 
     // TYPES //////////////////////////////////////////////////////////////////////////
     typedef enum
@@ -60,6 +63,28 @@ extern "C"
         xESK_CONTROL_NOT_FOUND = 10,
     } xESK_Control_Status_t;
 
+    // Value-only wire identity, suitable for retention while payload storage is reused.
+    typedef struct
+    {
+        uint8_t kind;
+        uint8_t opcode;
+        uint8_t status;
+        uint64_t request_id;
+        uint64_t boot_id;
+        uint64_t session_id;
+        uint16_t service_id;
+        uint16_t instance_id;
+    } xESK_Control_Header_t;
+
+    // Borrowed SERVICE payload; the provider owns storage through the consumer's
+    // terminal operation. Copy the header to retain identity independently of data.
+    typedef struct
+    {
+        xESK_Control_Header_t header;
+        const uint8_t *data;
+        size_t length;
+    } xESK_Control_Service_View_t;
+
     typedef struct
     {
         uint8_t kind;
@@ -81,7 +106,7 @@ extern "C"
             struct
             {
                 size_t length;
-                uint8_t data[xESK_MAX_FRAME_BYTES];
+                uint8_t data[xESK_SERVICE_FRAME_BYTES]; // SERVICE; others use at most xESK_MAX_FRAME_BYTES
             } payload;
         };
     } xESK_Control_Message_t;
@@ -95,6 +120,18 @@ extern "C"
     xRETURN_t xESK_Control_Encode(const xESK_Control_Message_t *message, uint8_t *buffer, size_t capacity, size_t *written);
     xRETURN_t xESK_Control_Decode(const uint8_t *buffer, size_t length, xESK_Control_Message_t *message);
     xRETURN_t xESK_Control_Reply_Validate(const xESK_Control_Message_t *request, const xESK_Control_Message_t *response);
+
+    // Decode validates the complete SERVICE envelope without copying payload bytes.
+    // The input must remain valid while the returned view is used. Failure preserves
+    // output; the typed view and input ranges must be valid and disjoint.
+    xRETURN_t xESK_Control_Service_Decode(const uint8_t *buffer, size_t length, xESK_Control_Service_View_t *view);
+    // Validate correlation using independent identity snapshots, without reading data.
+    xRETURN_t xESK_Control_Service_Reply_Validate(const xESK_Control_Header_t *request, const xESK_Control_Service_View_t *response);
+    // Payload is already at buffer + HEADER_BYTES (or empty). Only the header is
+    // written; no payload copy or move occurs. Validate all ranges before mutation.
+    // View and written must be disjoint from each other and the complete output.
+    xRETURN_t
+    xESK_Control_Service_Encode_In_Place(const xESK_Control_Service_View_t *view, uint8_t *buffer, size_t capacity, size_t *written);
 
 #ifdef __cplusplus
 } // extern "C"

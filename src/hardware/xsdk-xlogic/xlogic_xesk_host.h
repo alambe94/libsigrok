@@ -15,6 +15,8 @@
 #define xLOGIC_xESK_STOP_PENDING  (1UL << 4U)
 #define xLOGIC_xESK_SESSION_FAULT (1UL << 5U)
 #define xLOGIC_xESK_LEASE_MS      1000U
+// The xESK control header version (xESK_CONTROL_VERSION); the device rejects any other.
+#define xLOGIC_xESK_CONTROL_VERSION 2U
 
 // transfer returns exact byte count, or -1 on any transport error. Only common
 // FETCH may return -2 for its documented not-ready STALL. No mutation is retried.
@@ -117,7 +119,7 @@ static inline void xlogic_xesk_control_header(xLOGIC_xESK_Host_t *host, uint8_t 
 {
     memset(host->request, 0, sizeof(host->request));
     memcpy(host->request, "xESKCTRL", 8U);
-    host->request[8] = 1U;
+    host->request[8] = xLOGIC_xESK_CONTROL_VERSION;
     host->request[9] = 1U;
     host->request[10] = opcode;
     xlogic_xesk_put(host->request + 12U, bytes, 2U);
@@ -129,8 +131,9 @@ static inline void xlogic_xesk_control_header(xLOGIC_xESK_Host_t *host, uint8_t 
 
 static inline bool xlogic_xesk_control_fixed(const uint8_t *p, int bytes, uint8_t opcode)
 {
-    return bytes >= 48 && bytes <= 176 && memcmp(p, "xESKCTRL", 8U) == 0 && p[8] == 1U && p[9] == 2U && p[10] == opcode && p[11] <= 10U &&
-           xlogic_xesk_get(p + 12U, 2U) == (uint64_t)bytes && xlogic_xesk_get(p + 14U, 2U) == 0U && xlogic_xesk_get(p + 44U, 4U) == 0U;
+    return bytes >= 48 && bytes <= 176 && memcmp(p, "xESKCTRL", 8U) == 0 && p[8] == xLOGIC_xESK_CONTROL_VERSION && p[9] == 2U &&
+           p[10] == opcode && p[11] <= 10U && xlogic_xesk_get(p + 12U, 2U) == (uint64_t)bytes && xlogic_xesk_get(p + 14U, 2U) == 0U &&
+           xlogic_xesk_get(p + 44U, 4U) == 0U;
 }
 
 static inline bool xlogic_xesk_control_reply(xLOGIC_xESK_Host_t *host, int bytes, uint8_t opcode)

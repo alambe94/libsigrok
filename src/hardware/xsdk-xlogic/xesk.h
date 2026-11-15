@@ -21,9 +21,11 @@ extern "C"
 
 // PUBLIC API /////////////////////////////////////////////////////////
 // MACROS /////////////////////////////////////////////////////////////////////////
-#define xESK_WIRE_VERSION                   1U
-#define xESK_HEADER_BYTES                   12U
-#define xESK_MAX_FRAME_BYTES                128U
+#define xESK_WIRE_VERSION    1U
+#define xESK_HEADER_BYTES    12U
+#define xESK_MAX_FRAME_BYTES 128U
+// A SERVICE control payload: one service reply frame (12-byte header + 1,024).
+#define xESK_SERVICE_FRAME_BYTES            1036U
 #define xESK_MAX_REQUIREMENTS               32U
 #define xESK_LOGIC_RATE_PROFILE_1_MAX_HZ    500000000U
 #define xESK_LOGIC_RATE_PROFILE_1_MIN_BYTES 192U
@@ -250,6 +252,7 @@ extern "C"
         uint64_t buffer_bytes;
         uint32_t timebase_id;
         uint16_t requirement_count;
+        uint32_t max_operation_ms; // terminal bound of one operation, worst case over every configuration
     } xESK_Service_t;
 
     typedef struct
